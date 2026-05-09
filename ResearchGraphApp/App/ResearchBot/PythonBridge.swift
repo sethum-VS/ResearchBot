@@ -10,25 +10,29 @@ import Foundation
 
 final class PythonBridge {
 
-    /// Locates the Backend/main.py relative to the repo root.
+    /// Locates the Backend/main.py using environment variables or repository structure traversal.
     private var scriptURL: URL? {
-        // Resolve path from the bundle's resource path up to the repo root.
-        // During development the working directory is the repo root.
-        let repoRoot: URL
-        if let bundlePath = Bundle.main.resourceURL {
-            // Walk up: ResearchGraphApp/App/ResearchBot.app/Contents/Resources → repo root
-            repoRoot = bundlePath
-                .deletingLastPathComponent() // Contents
-                .deletingLastPathComponent() // .app
-                .deletingLastPathComponent() // ResearchBot (xcodeproj dir)
-                .deletingLastPathComponent() // App
-                .deletingLastPathComponent() // ResearchGraphApp
-        } else {
-            repoRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        // 1. Check for Environment Variable (Best for Xcode testing)
+        // Ensure you set BACKEND_PATH in Xcode Schema -> Arguments -> Environment Variables
+        if let envPath = ProcessInfo.processInfo.environment["BACKEND_PATH"] {
+            let url = URL(fileURLWithPath: envPath).appendingPathComponent("main.py")
+            if FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
         }
-        let scriptPath = repoRoot
-            .appendingPathComponent("ResearchGraphApp/Backend/main.py")
-        return FileManager.default.fileExists(atPath: scriptPath.path) ? scriptPath : nil
+
+        // 2. Fallback: Search up the directory tree (Useful for 'run.sh' and local dev)
+        // This handles cases where the app is in a deep build/ folder.
+        var currentURL = Bundle.main.bundleURL
+        for _ in 0..<8 { // Traverse up to 8 levels to find the repo root
+            let checkURL = currentURL.appendingPathComponent("Backend/main.py")
+            if FileManager.default.fileExists(atPath: checkURL.path) {
+                return checkURL
+            }
+            currentURL = currentURL.deletingLastPathComponent()
+        }
+
+        return nil
     }
 
     /// Runs main.py asynchronously. Calls `completion` on the main queue with stdout output.
