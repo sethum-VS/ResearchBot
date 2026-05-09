@@ -12,10 +12,10 @@ APP_DIR="$PROJECT_ROOT/App"
 SCHEME="ResearchBot"
 DERIVED_DATA_PATH="$PROJECT_ROOT/build"
 
-echo "🚀 Starting ResearchBot Sprint 1 Pipeline..."
+echo "Starting ResearchBot Sprint 1 Pipeline..."
 
 # --- 1. Python Environment Setup ---
-echo "🐍 Setting up Python environment..."
+echo "Setting up Python environment..."
 cd "$BACKEND_DIR"
 
 if [ ! -d ".venv" ]; then
@@ -29,12 +29,12 @@ pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
 # --- 2. Build macOS App ---
-echo "🏗 Building macOS App ($SCHEME)..."
+echo "Building macOS App ($SCHEME)..."
 cd "$APP_DIR"
 
 # Ensure we have a project to build
 if [ ! -d "ResearchBot.xcodeproj" ]; then
-    echo "❌ Error: ResearchBot.xcodeproj not found in $APP_DIR"
+    echo "Error: ResearchBot.xcodeproj not found in $APP_DIR"
     exit 1
 fi
 
@@ -46,14 +46,14 @@ xcodebuild build \
     | xcbeautify || xcodebuild build -project ResearchBot.xcodeproj -scheme "$SCHEME" -derivedDataPath "$DERIVED_DATA_PATH" -destination 'platform=macOS'
 
 # --- 3. Launch App ---
-echo "🏃 Launching ResearchBot..."
+echo "Launching ResearchBot..."
 APP_PATH=$(find "$DERIVED_DATA_PATH" -name "$SCHEME.app" -type d | head -n 1)
 
 if [ -z "$APP_PATH" ]; then
-    echo "❌ Error: Could not find built .app in $DERIVED_DATA_PATH"
+    echo "Error: Could not find built .app in $DERIVED_DATA_PATH"
     exit 1
 fi
 
 open "$APP_PATH"
 
-echo "✅ App launched successfully."
+echo "App launched successfully."

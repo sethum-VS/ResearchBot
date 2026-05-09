@@ -13,7 +13,7 @@ xcuserdata/
 
 # Only index the source code and documentation
 *
-!/App/**
-!/Backend/**
+!ResearchGraphApp/App/**
+!ResearchGraphApp/Backend/**
 !PROJECT_SPEC.md
 !README.md
