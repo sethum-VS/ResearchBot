@@ -71,6 +71,7 @@ venv/
 ENV/
 env.bak/
 .env
+build/
 
 # macOS
 .DS_Store
