@@ -72,6 +72,9 @@ ENV/
 env.bak/
 .env
 build/
+.vscode/
+README file.md
+READMEtavily.md
 
 # macOS
 .DS_Store

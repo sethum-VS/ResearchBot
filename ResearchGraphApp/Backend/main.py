@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-main.py — Phase 1 Ingestion Stub
-Entry point for the Backend orchestrator. Accepts CLI arguments from the
-Swift PythonBridge and simulates ingestion by printing structured JSON output.
+main.py — ResearchBot Backend Entry Point (Phases 2–4)
+Accepts CLI arguments from the Swift PythonBridge, delegates to
+IngestSeedUseCase which runs scraping, storage, synthesis, and graphify.
 
 Usage:
     python3 main.py --idea "Your research idea" --url "https://example.com"
@@ -10,7 +10,15 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
+
+from dotenv import load_dotenv
+
+# Load .env from repo root (two levels up from Backend/)
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+
+from application.IngestSeedUseCase import execute
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,39 +28,22 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def simulate_ingestion(idea: str, url: str) -> dict:
-    """
-    Stub: simulate the ingestion phase.
-    In future sprints this will call IngestSeedUseCase from /application.
-    """
-    if not idea.strip():
-        return {
+def main():
+    args = parse_args()
+    
+    try:
+        result = execute(args.idea, args.url)
+    except Exception as e:
+        result = {
             "status": "error",
-            "code": 1,
-            "message": "Idea cannot be empty. Provide a research topic via --idea.",
+            "message": f"Unexpected fatal error: {str(e)}",
+            "code": 1
         }
 
-    result = {
-        "status": "success",
-        "phase": "Phase 1 — Ingestion (Stub)",
-        "received": {
-            "idea": idea.strip(),
-            "url": url.strip() or None,
-        },
-        "next_step": "Phase 2 — Context Expansion & Scraping (not yet implemented)",
-    }
-    return result
+    print(json.dumps(result, indent=2, ensure_ascii=False))
 
-
-def main() -> None:
-    args = parse_args()
-    output = simulate_ingestion(args.idea, args.url)
-
-    # Always emit JSON to stdout so Swift Process() can parse it reliably
-    print(json.dumps(output, indent=2))
-
-    if output.get("status") == "error":
-        sys.exit(1)
+    if result.get("status") == "error":
+        sys.exit(result.get("code", 1))
 
 
 if __name__ == "__main__":
