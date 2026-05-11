@@ -5,15 +5,18 @@ __pycache__/
 node_modules/
 build/
 DerivedData/
+.vscode/
 
 # Ignore local configuration and secrets
 .env
 *.pbxuser
 xcuserdata/
+Backend/infrastructure/firecrawl/
 
 # Only index the source code and documentation
 *
 !ResearchGraphApp/App/**
 !ResearchGraphApp/Backend/**
+!ResearchGraphApp/research_knowledge_base/**
 !PROJECT_SPEC.md
 !README.md

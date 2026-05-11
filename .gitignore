@@ -75,6 +75,9 @@ build/
 .vscode/
 README file.md
 READMEtavily.md
+firecrawl/
+research_knowledge_base/
+Assets.xcassets/
 
 # macOS
 .DS_Store

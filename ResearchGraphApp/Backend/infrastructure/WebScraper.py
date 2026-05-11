@@ -66,12 +66,13 @@ def firecrawl_advanced_search(
         if keywords and not sections:
             search_result = app.search(
                 keywords[0],
-                params={'scrapeOptions': {'formats': ['markdown']}},
+                scrape_options={'formats': ['markdown']},
             )
-            for item in (search_result.get('data') or []):
-                md = item.get('markdown', '')
+            for item in (getattr(search_result, 'web', None) or []):
+                md = getattr(item, 'markdown', '') or ''
                 if md:
-                    source = item.get('metadata', {}).get('sourceURL', 'unknown')
+                    metadata = getattr(item, 'metadata', None)
+                    source = getattr(metadata, 'source_url', 'unknown') if metadata else 'unknown'
                     sections.append(f"<!-- source: {source} -->\n{md}")
 
     except Exception as e:

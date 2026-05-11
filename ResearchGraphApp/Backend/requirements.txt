@@ -4,3 +4,6 @@ tavily-python
 requests
 python-dotenv
 firecrawl-py
+openai
+fastapi
+uvicorn

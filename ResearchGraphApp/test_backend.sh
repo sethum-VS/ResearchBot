@@ -1,21 +1,15 @@
 #!/bin/bash
 
-# ResearchBot — Master App Launcher (Xcode Bootstrapper)
-# Performs all infra checks, builds the macOS app via xcodebuild,
-# and launches the compiled .app bundle.
-#
-# Usage:  ./run.sh
+# ResearchBot — Backend Sandbox Tester
+# Automates infra checks and triggers the pipeline with a static topic.
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR/Backend"
-APP_DIR="$SCRIPT_DIR/App"
-SCHEME="ResearchBot"
-DERIVED_DATA_PATH="$SCRIPT_DIR/build"
 
 echo "========================================="
-echo "🚀 Starting ResearchBot Pipeline Setup"
+echo "🧪 Starting ResearchBot Backend Sandbox"
 echo "========================================="
 
 # --- 1. GCP Auth Auto-Remedy ---
@@ -61,33 +55,9 @@ else
     echo "✅ Firecrawl is running at localhost:3002."
 fi
 
-# --- 3. Xcode Build ---
-echo "🍏 Building macOS App ($SCHEME)..."
-cd "$APP_DIR"
+# --- 3. Execute Pipeline via Bridge ---
+echo "🚀 Triggering Pipeline via execute_pipeline.sh..."
+cd "$SCRIPT_DIR"
+./execute_pipeline.sh --idea "AI Agents for Automated Code Review"
 
-if command -v xcbeautify &> /dev/null; then
-    xcodebuild build \
-        -project "ResearchGraph.xcodeproj" \
-        -scheme "$SCHEME" \
-        -derivedDataPath "../build" \
-        -destination 'platform=macOS' | xcbeautify
-else
-    echo "ℹ️  xcbeautify not found, using standard output..."
-    xcodebuild build \
-        -project "ResearchGraph.xcodeproj" \
-        -scheme "$SCHEME" \
-        -derivedDataPath "../build" \
-        -destination 'platform=macOS'
-fi
-
-# --- 4. Launch App ---
-echo "🚀 Launching ResearchGraph..."
-APP_PATH=$(find "../build" -name "*.app" -type d | head -n 1)
-
-if [ -z "$APP_PATH" ]; then
-    echo "❌ Error: Could not find built .app in ../build"
-    exit 1
-fi
-
-open "$APP_PATH"
-echo "✅ App launched successfully."
+echo "✅ Backend test completed successfully."

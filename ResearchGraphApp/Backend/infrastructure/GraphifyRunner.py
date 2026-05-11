@@ -1,8 +1,12 @@
 """
 GraphifyRunner.py — Shell executor for the Graphify knowledge-graph pipeline.
-Runs ``graphify <knowledge_base_path>`` as a subprocess and captures output.
+
+Routes LLM extraction through the local VertexProxy (localhost:8000) by
+using Graphify's ``ollama`` backend — the only backend whose base_url is
+configurable via the ``OLLAMA_BASE_URL`` environment variable.
 """
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -22,7 +26,7 @@ class GraphifyError(Exception):
 
 def run_graphify(kb_path: Path | None = None) -> str:
     """
-    Execute ``graphify <path>`` and return its stdout.
+    Execute the full Graphify pipeline and return stdout.
 
     Parameters
     ----------
@@ -42,15 +46,45 @@ def run_graphify(kb_path: Path | None = None) -> str:
             f"Knowledge base directory not found: {target}"
         )
 
-    result = subprocess.run(
-        ["graphify", str(target)],
+    env = os.environ.copy()
+    # Graphify's ollama backend is the only one whose base_url is
+    # configurable via an env var.  Point it at our local VertexProxy.
+    env["OLLAMA_BASE_URL"] = "http://localhost:8000/v1"
+    env["OLLAMA_API_KEY"] = "dummy-proxy-key"
+    env["GRAPHIFY_MAX_OUTPUT_TOKENS"] = "65536"
+
+    cwd = str(target.parent)  # run from ResearchGraphApp/
+
+    # 1. Headless Extraction (produces graph.json)
+    result_extract = subprocess.run(
+        [
+            "graphify", "extract", str(target),
+            "--backend", "ollama",
+            "--model", "gemini-2.5-flash",
+        ],
         capture_output=True,
         text=True,
-        cwd=str(target.parent),   # run from ResearchGraphApp/
-        timeout=120,
+        cwd=cwd,
+        timeout=600,
+        env=env,
     )
 
-    if result.returncode != 0:
-        raise GraphifyError(result.returncode, result.stderr.strip())
+    if result_extract.returncode != 0:
+        raise GraphifyError(result_extract.returncode, result_extract.stderr.strip())
 
-    return result.stdout
+    # 2. Visual Artifact Generation (produces graph.html and GRAPH_REPORT.md)
+    result_viz = subprocess.run(
+        [
+            "graphify", "cluster-only", str(target),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+        timeout=300,
+        env=env,
+    )
+
+    if result_viz.returncode != 0:
+        raise GraphifyError(result_viz.returncode, result_viz.stderr.strip())
+
+    return result_extract.stdout + "\n" + result_viz.stdout

@@ -95,7 +95,7 @@ def execute(idea: str, url: str) -> dict:
     except FileNotFoundError as e:
         graphify_error = str(e)
 
-    graph_path_abs = get_kb_root().parent / "graphify-out" / "graph.html"
+    graph_path_abs = get_kb_root() / "graphify-out" / "graph.html"
 
     return {
         "status": "success",

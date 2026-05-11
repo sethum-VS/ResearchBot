@@ -16,9 +16,12 @@ import sys
 from dotenv import load_dotenv
 
 # Load .env from repo root (two levels up from Backend/)
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+current_dir = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.abspath(os.path.join(current_dir, "..", "..", ".env"))
+load_dotenv(env_path)
 
 from application.IngestSeedUseCase import execute
+from infrastructure.GraphifyRunner import GraphifyError
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +36,14 @@ def main():
     
     try:
         result = execute(args.idea, args.url)
+        if result.get("graphify", {}).get("error"):
+            raise GraphifyError(1, result["graphify"]["error"])
+    except GraphifyError as e:
+        result = {
+            "status": "error",
+            "message": f"Graphify pipeline failed: {e.stderr}",
+            "code": 1
+        }
     except Exception as e:
         result = {
             "status": "error",
