@@ -26,6 +26,7 @@ struct PipelineResult: Codable {
     }
 }
 
+@MainActor
 @Observable
 final class PythonBridge {
 
@@ -77,7 +78,7 @@ final class PythonBridge {
         }
     }
 
-    private func executeProcess(script: String, idea: String) async {
+    nonisolated private func executeProcess(script: String, idea: String) async {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script, "--idea", idea]
@@ -96,8 +97,10 @@ final class PythonBridge {
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
+            
+            let bridge = self
             Task { @MainActor in
-                self?.progress += line
+                bridge?.progress += line
             }
         }
 
@@ -113,8 +116,7 @@ final class PythonBridge {
         }
 
         stdoutPipe.fileHandleForReading.readabilityHandler = nil
-
-        let fullOutput = progress
+        let fullOutput = await MainActor.run { self.progress }
 
         await MainActor.run {
             parseOutput(fullOutput, exitCode: process.terminationStatus)
