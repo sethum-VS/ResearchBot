@@ -55,36 +55,40 @@ def run_graphify(kb_path: Path | None = None) -> str:
 
     cwd = str(target.parent)  # run from ResearchGraphApp/
 
-    # 1. Headless Extraction (produces graph.json)
-    result_extract = subprocess.run(
-        [
-            "graphify", "extract", str(target),
-            "--backend", "ollama",
-            "--model", "gemini-2.5-flash",
-        ],
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-        timeout=600,
-        env=env,
-    )
+    try:
+        # 1. Headless Extraction (produces graph.json)
+        result_extract = subprocess.run(
+            [
+                "graphify", "extract", str(target),
+                "--backend", "ollama",
+                "--model", "gemini-2.5-flash",
+            ],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=1800,
+            env=env,
+        )
 
-    if result_extract.returncode != 0:
-        raise GraphifyError(result_extract.returncode, result_extract.stderr.strip())
+        if result_extract.returncode != 0:
+            raise GraphifyError(result_extract.returncode, result_extract.stderr.strip())
 
-    # 2. Visual Artifact Generation (produces graph.html and GRAPH_REPORT.md)
-    result_viz = subprocess.run(
-        [
-            "graphify", "cluster-only", str(target),
-        ],
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-        timeout=300,
-        env=env,
-    )
+        # 2. Visual Artifact Generation (produces graph.html and GRAPH_REPORT.md)
+        result_viz = subprocess.run(
+            [
+                "graphify", "cluster-only", str(target),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=600,
+            env=env,
+        )
 
-    if result_viz.returncode != 0:
-        raise GraphifyError(result_viz.returncode, result_viz.stderr.strip())
+        if result_viz.returncode != 0:
+            raise GraphifyError(result_viz.returncode, result_viz.stderr.strip())
+
+    except subprocess.TimeoutExpired as e:
+        raise GraphifyError(1, f"Graphify pipeline timed out after {e.timeout} seconds.")
 
     return result_extract.stdout + "\n" + result_viz.stdout

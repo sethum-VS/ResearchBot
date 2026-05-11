@@ -12,6 +12,19 @@ echo "========================================="
 echo "🧪 Starting ResearchBot Backend Sandbox"
 echo "========================================="
 
+# Cleanup function to close all processors on backend ports
+cleanup() {
+    echo "🧹 Finalizing cleanup..."
+    # The execute_pipeline.sh handles port 8000.
+    # We only stop Firecrawl if the user explicitly wants to "clear all".
+    if [ "$FIRECRAWL_STARTED" = true ]; then
+        echo "🐳 Stopping Firecrawl Docker containers..."
+        cd "$FIRECRAWL_DIR" && docker compose down && cd "$SCRIPT_DIR"
+    fi
+}
+
+trap cleanup EXIT
+
 # --- 1. GCP Auth Auto-Remedy ---
 echo "☁️  Checking Google Cloud ADC..."
 GCP_CREDS="$HOME/.config/gcloud/application_default_credentials.json"
@@ -24,10 +37,9 @@ fi
 
 # --- 2. Firecrawl Auto-Remedy ---
 echo "🔥 Checking Firecrawl local instance..."
+FIRECRAWL_DIR="$BACKEND_DIR/infrastructure/firecrawl"
 if ! curl -s http://localhost:3002 > /dev/null; then
     echo "⚠️  Firecrawl is down. Attempting bootstrap..."
-
-    FIRECRAWL_DIR="$BACKEND_DIR/infrastructure/firecrawl"
 
     if [ ! -d "$FIRECRAWL_DIR" ]; then
         echo "📥 Cloning Firecrawl from GitHub..."
@@ -48,6 +60,7 @@ if ! curl -s http://localhost:3002 > /dev/null; then
     echo "🐳 Starting Firecrawl via Docker Compose..."
     cd "$FIRECRAWL_DIR"
     docker compose up -d
+    FIRECRAWL_STARTED=true
     cd "$SCRIPT_DIR"
     echo "⏳ Waiting for Firecrawl to initialize (15s)..."
     sleep 15

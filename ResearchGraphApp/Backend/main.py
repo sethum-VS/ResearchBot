@@ -51,7 +51,9 @@ def main():
             "code": 1
         }
 
+    print("\n---PIPELINE_RESULT_START---")
     print(json.dumps(result, indent=2, ensure_ascii=False))
+    print("---PIPELINE_RESULT_END---")
 
     if result.get("status") == "error":
         sys.exit(result.get("code", 1))

@@ -122,16 +122,23 @@ final class PythonBridge {
         }
     }
 
-    // MARK: - JSON Parsing
-
-    /// Extract the JSON object from stdout (may contain log lines before it).
+    /// Extract the JSON object from stdout using the PIPELINE_RESULT markers.
     private func parseOutput(_ raw: String, exitCode: Int32) {
-        // Find the first '{' that starts the JSON payload
-        guard let jsonStart = raw.firstIndex(of: "{"),
-              let jsonData = raw[jsonStart...].data(using: .utf8) else {
+        let startMarker = "---PIPELINE_RESULT_START---"
+        let endMarker = "---PIPELINE_RESULT_END---"
+
+        guard let startRange = raw.range(of: startMarker),
+              let endRange = raw.range(of: endMarker),
+              startRange.upperBound < endRange.lowerBound else {
             if exitCode != 0 {
-                errorMessage = "Pipeline failed (exit \(exitCode)). No JSON payload found."
+                errorMessage = "Pipeline failed (exit \(exitCode)). Result markers not found."
             }
+            return
+        }
+
+        let jsonString = String(raw[startRange.upperBound..<endRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let jsonData = jsonString.data(using: .utf8) else {
+            errorMessage = "Failed to convert result string to data."
             return
         }
 
@@ -146,7 +153,7 @@ final class PythonBridge {
                 errorMessage = nil
             }
         } catch {
-            errorMessage = "JSON decode error: \(error.localizedDescription)"
+            errorMessage = "JSON decode error: \(error.localizedDescription)\n\nRaw JSON was:\n\(jsonString)"
         }
     }
 }

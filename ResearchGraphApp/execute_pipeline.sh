@@ -10,8 +10,16 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR/Backend"
 
-# Kill the Vertex proxy on exit.
-trap 'if [ -n "$PROXY_PID" ]; then kill "$PROXY_PID" 2>/dev/null; fi' EXIT
+# Cleanup function to close all processors on backend ports
+cleanup() {
+    echo "🧹 Cleaning up backend processes..."
+    # Kill process on port 8000 (VertexProxy)
+    lsof -ti :8000 | xargs kill -9 2>/dev/null || true
+    # We leave 3002 (Firecrawl) running as it is often a heavy Docker container, 
+    # but the user can add it here if they want strict cleanup.
+}
+
+trap cleanup EXIT
 
 # --- Activate Python Environment ---
 cd "$BACKEND_DIR"
@@ -22,9 +30,13 @@ fi
 source .venv/bin/activate
 
 # --- Start Vertex AI Proxy ---
-uvicorn infrastructure.VertexProxy:app --port 8000 --log-level warning &
-PROXY_PID=$!
-sleep 2
+if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null ; then
+    echo "✅ VertexProxy is already running on port 8000."
+else
+    echo "🚀 Starting Vertex AI Proxy..."
+    uvicorn infrastructure.VertexProxy:app --port 8000 --log-level warning &
+    sleep 2
+fi
 
 # --- Execute Pipeline (pass all args through to main.py) ---
 python3 main.py "$@"
