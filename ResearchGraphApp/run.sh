@@ -67,21 +67,21 @@ cd "$APP_DIR"
 
 if command -v xcbeautify &> /dev/null; then
     xcodebuild build \
-        -project "ResearchGraph.xcodeproj" \
+        -project "ResearchBot.xcodeproj" \
         -scheme "$SCHEME" \
         -derivedDataPath "../build" \
         -destination 'platform=macOS' | xcbeautify
 else
     echo "ℹ️  xcbeautify not found, using standard output..."
     xcodebuild build \
-        -project "ResearchGraph.xcodeproj" \
+        -project "ResearchBot.xcodeproj" \
         -scheme "$SCHEME" \
         -derivedDataPath "../build" \
         -destination 'platform=macOS'
 fi
 
 # --- 4. Launch App ---
-echo "🚀 Launching ResearchGraph..."
+echo "🚀 Launching ResearchBot..."
 APP_PATH=$(find "../build" -name "*.app" -type d | head -n 1)
 
 if [ -z "$APP_PATH" ]; then
