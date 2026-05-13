@@ -1,7 +1,7 @@
 """
 AgentSynthesizer.py — Gemini 2.5 Pro LLM synthesis via Vertex AI.
 Uses google-genai SDK with Application Default Credentials (ADC).
-Analyzes scraped context to extract competitors, research gaps, and core findings.
+Analyzes scraped context to extract structural holes between social problems and academic limitations.
 """
 
 import os
@@ -19,8 +19,21 @@ def synthesize_context(context_text: str) -> str:
         model = "gemini-2.5-pro"
 
         prompt = (
-            "Analyze the following research context and synthesize the core findings, "
-            "competitors, and research gaps:\n\n"
+            "You are an expert academic research engine. Analyze the following scraped context, "
+            "which contains social media problems and academic literature reviews.\n\n"
+            "Your goal is to synthesize this information into a Final Year Project (FYP) rubric. "
+            "Actively identify 'Structural Holes' between the societal problems discussed on social platforms "
+            "and the limitations documented in the academic literature to propose a novel approach.\n\n"
+            "You MUST strictly output your synthesis using the following Markdown headers:\n\n"
+            "## Problem Background\n"
+            "(Synthesize the societal/practical problems found)\n\n"
+            "## Existing Solutions/Competitors (Literature)\n"
+            "(Synthesize the current work in the domain)\n\n"
+            "## Methodological Weaknesses (The Gap)\n"
+            "(Identify structural holes, limitations, and areas for future work)\n\n"
+            "## Proposed Novelty\n"
+            "(Propose a novel FYP approach addressing the gap)\n\n"
+            "Here is the context data:\n"
             f"{context_text}"
         )
 
