@@ -6,6 +6,7 @@ Analyzes scraped context to extract structural holes between social problems and
 
 import os
 from google import genai
+from google.genai import types
 
 
 def synthesize_context(context_text: str) -> str:
@@ -37,9 +38,14 @@ def synthesize_context(context_text: str) -> str:
             f"{context_text}"
         )
 
+        config = types.GenerateContentConfig(
+            max_output_tokens=65536,
+        )
+
         response = client.models.generate_content(
             model=model,
             contents=[prompt],
+            config=config,
         )
         return response.text
     except Exception as e:

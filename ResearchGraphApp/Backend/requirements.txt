@@ -7,3 +7,4 @@ firecrawl-py
 openai
 fastapi
 uvicorn
+tenacity

@@ -83,3 +83,43 @@ def firecrawl_advanced_search(
         return f"# No results\nFirecrawl returned no data for: {query_desc}"
 
     return "\n\n---\n\n".join(sections)
+
+
+# ── Deep Crawl for Phase 2.5 ─────────────────────────────────────────────
+
+def deep_crawl_urls(urls: list[str], max_pages_per_domain: int = 5) -> str:
+    """
+    Deep-crawl a list of URLs discovered during Phase 2.
+    Returns combined Markdown from all crawled pages.
+
+    Args:
+        urls: List of URLs to crawl.
+        max_pages_per_domain: Max pages to crawl per URL (default 5).
+    """
+    if not urls:
+        return ""
+
+    app = _get_app()
+    sections: list[str] = []
+
+    for url in urls:
+        try:
+            crawl_result = app.crawl_url(
+                url,
+                params={
+                    'limit': max_pages_per_domain,
+                    'scrapeOptions': {'formats': ['markdown']},
+                },
+            )
+            for page in (crawl_result.get('data') or []):
+                md = page.get('markdown', '')
+                if md:
+                    source = page.get('metadata', {}).get('sourceURL', url)
+                    sections.append(f"<!-- source: {source} -->\n{md}")
+        except Exception as e:
+            sections.append(f"# Deep Crawl Error for {url}\n{e}")
+
+    if not sections:
+        return "# No results\nDeep crawl returned no data."
+
+    return "\n\n---\n\n".join(sections)
