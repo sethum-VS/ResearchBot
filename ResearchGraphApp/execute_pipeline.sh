@@ -10,6 +10,18 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR/Backend"
 
+# Load .env from the project root (one level above ResearchGraphApp/)
+ENV_FILE="$SCRIPT_DIR/../.env"
+if [ -f "$ENV_FILE" ]; then
+    echo "📄 Loading environment variables from .env"
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+else
+    echo "⚠️  .env not found at $ENV_FILE"
+fi
+
 # Cleanup function to close all processors on backend ports
 cleanup() {
     echo "🧹 Cleaning up backend processes..."

@@ -83,3 +83,38 @@ def firecrawl_advanced_search(
         return f"# No results\nFirecrawl returned no data for: {query_desc}"
 
     return "\n\n---\n\n".join(sections)
+
+
+# ── Deep Crawl Individual URLs ───────────────────────────────────────────────
+
+def deep_crawl_urls(urls: list[str]) -> str:
+    """
+    Scrape each URL individually and return concatenated Markdown.
+
+    Unlike firecrawl_advanced_search (which crawls from a root),
+    this function performs a targeted single-page scrape per URL.
+
+    Parameters
+    ----------
+    urls : list of fully-qualified URLs to scrape.
+
+    Returns
+    -------
+    Combined Markdown from all successfully scraped pages.
+    """
+    if not urls:
+        return ""
+
+    app = _get_app()
+    sections: list[str] = []
+
+    for url in urls:
+        try:
+            result = app.scrape_url(url, params={'formats': ['markdown']})
+            md = result.get('markdown', '')
+            if md:
+                sections.append(f"<!-- source: {url} -->\n{md}")
+        except Exception as e:
+            sections.append(f"# Deep Crawl Error\nFailed to scrape `{url}`: {e}")
+
+    return "\n\n---\n\n".join(sections)

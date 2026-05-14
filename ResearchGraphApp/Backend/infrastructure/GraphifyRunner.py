@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -253,7 +254,7 @@ def post_process_artifacts(target_dir: Path) -> None:
     Handles missing files gracefully — if Graphify failed to produce
     an artifact, the corresponding step is silently skipped.
     """
-    out_dir = target_dir.parent / "graphify-out"
+    out_dir = target_dir / "graphify-out"
     html_path = out_dir / "graph.html"
     json_path = out_dir / "graph.json"
 
@@ -309,16 +310,77 @@ def post_process_artifacts(target_dir: Path) -> None:
         logger.warning("graph.json not found at %s; skipping community naming.", json_path)
 
 
+# ── Semantic Input Filtering ─────────────────────────────────────────────────
+
+def _prepare_filtered_kb(kb_path: Path, current_run_files: list[Path]) -> Path:
+    """
+    Build a temporary directory containing only high-quality, refined
+    Markdown files suitable for Graphify extraction.
+
+    Inclusion rules (from current_run_files)
+    ─────────────────────────────────────────
+    - The primary Academic Data Refinement summary.
+    - All processed_summaries.
+    - Files starting with '# Wiki:'.
+    - All individual _URLRefiner.md files.
+
+    Returns the path to the temporary directory.
+    """
+    temp_dir = kb_path / "temp_graph_input"
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True)
+
+    for f in current_run_files:
+        if not f.is_file():
+            continue
+
+        name = f.name.lower()
+        include = False
+
+        # Include _URLRefiner.md files
+        if "_urlrefiner" in name:
+            include = True
+        # Include processed_summaries (parent dir check)
+        elif f.parent.name == "processed_summaries":
+            include = True
+        else:
+            # Check file content for Academic Data Refinement or Wiki prefix
+            try:
+                header = f.read_text(encoding="utf-8")[:200]
+                if header.startswith("# Wiki:") or "Academic Data Refin" in header:
+                    include = True
+            except OSError:
+                pass
+
+        # Fallback: include any file explicitly in current_run_files
+        # from agent_scrapes (refinement outputs)
+        if not include and f.parent.name == "agent_scrapes":
+            include = True
+
+        if include:
+            try:
+                shutil.copy2(f, temp_dir / f.name)
+            except OSError as e:
+                logger.warning("Could not copy %s: %s", f, e)
+
+    return temp_dir
+
+
 # ── Main Runner ──────────────────────────────────────────────────────────────
 
-def run_graphify(kb_path: Path | None = None) -> str:
+def run_graphify(current_run_files: list[Path], kb_path: Path | None = None) -> str:
     """
     Execute the full Graphify pipeline and return stdout.
 
-    Parameters
-    ----------
-    kb_path : optional override for the knowledge-base directory.
-              Defaults to the canonical ``research_knowledge_base`` folder.
+    Steps
+    -----
+    1. Build a filtered temp directory with only current run data.
+    2. Run ``graphify extract`` against the temp directory (llama-4-scout).
+    3. Run ``graphify cluster-only`` against the temp directory.
+    4. Move resulting ``graphify-out/`` into the canonical KB location.
+    5. Run post-processing (resizable sidebar + smart community naming).
+    6. Clean up the temp directory.
 
     Raises
     ------
@@ -333,22 +395,27 @@ def run_graphify(kb_path: Path | None = None) -> str:
             f"Knowledge base directory not found: {target}"
         )
 
+    # ── Build filtered input set ─────────────────────────────────────────
+    filtered_dir = _prepare_filtered_kb(target, current_run_files)
+    logger.info("Filtered KB prepared at %s (%d files).",
+                filtered_dir, sum(1 for _ in filtered_dir.iterdir()))
+
     env = os.environ.copy()
     # Graphify's ollama backend is the only one whose base_url is
     # configurable via an env var.  Point it at our local VertexProxy.
     env["OLLAMA_BASE_URL"] = "http://localhost:8000/v1"
     env["OLLAMA_API_KEY"] = "dummy-proxy-key"
-    env["GRAPHIFY_MAX_OUTPUT_TOKENS"] = "65536"
 
     cwd = str(target.parent)  # run from ResearchGraphApp/
 
     try:
         # 1. Headless Extraction (produces graph.json)
+        #    Uses Llama 4 Scout (10M context) — no --token-budget needed.
         result_extract = subprocess.run(
             [
-                "graphify", "extract", str(target),
+                "graphify", "extract", str(filtered_dir),
                 "--backend", "ollama",
-                "--model", "gemini-2.5-flash",
+                "--model", "llama-4-scout",
             ],
             capture_output=True,
             text=True,
@@ -363,7 +430,7 @@ def run_graphify(kb_path: Path | None = None) -> str:
         # 2. Visual Artifact Generation (produces graph.html and GRAPH_REPORT.md)
         result_viz = subprocess.run(
             [
-                "graphify", "cluster-only", str(target),
+                "graphify", "cluster-only", str(filtered_dir),
             ],
             capture_output=True,
             text=True,
@@ -376,9 +443,27 @@ def run_graphify(kb_path: Path | None = None) -> str:
             raise GraphifyError(result_viz.returncode, result_viz.stderr.strip())
 
     except subprocess.TimeoutExpired as e:
+        # Clean up even on timeout
+        shutil.rmtree(filtered_dir, ignore_errors=True)
         raise GraphifyError(1, f"Graphify pipeline timed out after {e.timeout} seconds.")
 
-    # 3. Post-process generated artifacts (resizable sidebar + smart naming)
+    # ── Move artifacts to canonical location ─────────────────────────────
+    temp_out = filtered_dir / "graphify-out"
+    canonical_out = target / "graphify-out"
+
+    if temp_out.is_dir():
+        if canonical_out.exists():
+            shutil.rmtree(canonical_out)
+        shutil.move(str(temp_out), str(canonical_out))
+        logger.info("Moved graphify-out to canonical location: %s", canonical_out)
+    else:
+        logger.warning("graphify-out not found in temp dir; artifacts may be missing.")
+
+    # ── Clean up temp directory ──────────────────────────────────────────
+    shutil.rmtree(filtered_dir, ignore_errors=True)
+    logger.info("Cleaned up temporary filtered KB.")
+
+    # ── Post-process generated artifacts ─────────────────────────────────
     try:
         post_process_artifacts(target)
     except Exception as e:
