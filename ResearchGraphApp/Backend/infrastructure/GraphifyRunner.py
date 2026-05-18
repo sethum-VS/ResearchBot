@@ -19,7 +19,10 @@ import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from dotenv import load_dotenv
 from infrastructure.FileStorage import get_kb_root
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -410,12 +413,16 @@ def run_graphify(current_run_files: list[Path], kb_path: Path | None = None) -> 
 
     try:
         # 1. Headless Extraction (produces graph.json)
-        #    Uses Llama 4 Scout (10M context) — no --token-budget needed.
+        #    Uses Llama 4 Scout via VertexProxy. Token budget forces Graphify
+        #    to split the corpus into semantic windows so the model extracts
+        #    micro-details per chunk instead of macro-summarising the entire
+        #    corpus into a handful of nodes.
         result_extract = subprocess.run(
             [
                 "graphify", "extract", str(filtered_dir),
                 "--backend", "ollama",
                 "--model", "llama-4-scout",
+                "--token-budget", "8000",
             ],
             capture_output=True,
             text=True,

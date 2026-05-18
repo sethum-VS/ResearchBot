@@ -48,7 +48,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Body
 from fastapi.responses import JSONResponse
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
@@ -296,13 +296,12 @@ def _extract_finish_reason(response) -> str:
 
 
 @app.post("/{path:path}")
-async def proxy(path: str, request: Request):
+def proxy(path: str, request: Request, body: dict = Body(...)):
     """
     Catch-all POST handler.  Graphify sends OpenAI-style
     ``/chat/completions`` requests here.  We forward the
     contents to Vertex AI and return an OpenAI-shaped response.
     """
-    body = await request.json()
 
     # --- Extract model --------------------------------------------------
     model_name = body.get("model", "gemini-2.5-flash")
@@ -332,15 +331,19 @@ async def proxy(path: str, request: Request):
     # tokens by Meta's MaaS contract (400 INVALID_ARGUMENT above that).
     is_llama = model_name.startswith("llama-4")
 
+    # Extract client-requested token cap (OpenAI uses "max_tokens")
+    client_max_tokens = body.get("max_tokens") or body.get("max_output_tokens")
+
     if is_llama:
         gen_config = types.GenerateContentConfig(
             temperature=0.1,
             max_output_tokens=_LLAMA_MAX_OUTPUT_TOKENS,
         )
     else:
+        resolved_max_tokens = min(client_max_tokens, 65536) if client_max_tokens else 65536
         gen_config = types.GenerateContentConfig(
             temperature=body.get("temperature", 0),
-            max_output_tokens=65536,
+            max_output_tokens=resolved_max_tokens,
         )
 
     # --- System instruction routing -------------------------------------
