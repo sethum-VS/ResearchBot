@@ -2,7 +2,7 @@
 IngestSeedUseCase.py — Full pipeline orchestrator (Phases 1.5 → 4).
 Wires InputAnalyzer → Phase 2 scrapers → Phase 2.5 refiner → Phase 2.6
 recursive URL refinement → Phase 3 storage → Phase 4 graphify into a
-single, sequential pipeline invoked from main.py.
+single, high-concurrency pipeline invoked from main.py.
 
 SESSION ISOLATION CONTRACT
 ──────────────────────────
@@ -18,11 +18,25 @@ deep_crawl_md), NO file system reads from /research_knowledge_base, /agent_scrap
 /raw_ingestion, or /processed_summaries directories are permitted to enter
 full_context. Those variables are written to disk for Graphify but MUST NOT
 be re-appended into the synthesis context.
+
+CONCURRENCY MODEL
+─────────────────
+Phase 2   — ThreadPoolExecutor (3 workers): Social, Academic, Wiki run in parallel.
+             Firecrawl runs first (sequential) since it seeds the URL list.
+Phase 2.6 — ThreadPoolExecutor (max_workers=5): Multiple URLs crawled + refined
+             simultaneously with a threading.Lock on current_run_files.
 """
 
+import os
+import asyncio
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from google import genai
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from application.InputAnalyzer import analyze_seed
 from application.AgentSynthesizer import synthesize_context
@@ -36,43 +50,137 @@ from infrastructure.GraphifyRunner import run_graphify, GraphifyError
 
 logger = logging.getLogger(__name__)
 
-# ── Regex for extracting URLs from the refiner's "High-Value URLs" section ───
+# ── Concurrency Tuning ──────────────────────────────────────────────────────
+_PHASE2_WORKERS = 3        # Social, Academic, Wiki in parallel
+_PHASE26_MAX_WORKERS = 5   # Cap for recursive URL refinement
 
-_HIGH_VALUE_URL_PATTERN = re.compile(
-    r"###\s*5\.0\s+High-Value URLs for Next Crawl.*?(?=\n###|\Z)",
-    re.DOTALL | re.IGNORECASE,
+
+def _is_resource_exhausted(exc: Exception) -> bool:
+    """Check if the exception is a 429 ResourceExhausted."""
+    exc_str = str(exc).lower()
+    return "429" in exc_str or "resourceexhausted" in exc_str or "resource_exhausted" in exc_str
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception(_is_resource_exhausted)
 )
-_URL_EXTRACTOR = re.compile(r"https?://[^\s\)\]\>\"]+")
-
-
-def _extract_high_value_urls(refined_text: str) -> list[str]:
+async def _extract_high_value_urls(refined_text: str) -> list[str]:
     """
-    Parse the '### 5.0 High-Value URLs for Next Crawl' section from
-    the DataRefiner output and return a deduplicated list of URLs.
+    Extract high-value URLs for next crawl using Gemini 2.5 Flash.
+    Returns a list of strings in the format 'Title [URL]'.
     """
-    match = _HIGH_VALUE_URL_PATTERN.search(refined_text)
-    if not match:
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
+    if not project_id:
+        logger.warning("GOOGLE_CLOUD_PROJECT_ID not set. Cannot extract URLs.")
         return []
 
-    section = match.group(0)
-    urls = _URL_EXTRACTOR.findall(section)
-    # Deduplicate while preserving order
-    seen: set[str] = set()
-    unique: list[str] = []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            unique.append(u)
-    return unique
+    try:
+        client = genai.Client(vertexai=True, project=project_id, location="global")
+        prompt = (
+            "You are a data extraction specialist. Look at the provided research summary "
+            "and find the section regarding 'High-Value URLs for Next Crawl Phase'. "
+            "Extract every title and its associated URL. Format the output strictly as a "
+            "simple list of 'Title [URL]'. Return ONLY the list, with no preamble or explanation."
+        )
+
+        # Call Gemini 2.5 Flash via google-genai SDK
+        response = await client.aio.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"{prompt}\n\n{refined_text}"
+        )
+
+        if not response.text:
+            return []
+
+        return [line.strip() for line in response.text.strip().split('\n') if line.strip()]
+
+    except Exception as e:
+        logger.error("Failed to extract URLs via LLM: %s", e)
+        return []
+
+
+def _refine_single_url(
+    index: int,
+    entry: str,
+    primary_keyword: str,
+    saved_files: list[str],
+    current_run_files: list[Path],
+    lock: threading.Lock,
+) -> None:
+    """
+    Worker function for Phase 2.6: scrape one high-value URL, refine it,
+    and thread-safely append to shared lists.
+    """
+    try:
+        url_match = re.search(r'\[(https?://[^\]]+)\]', entry)
+        title_match = re.search(r'^(.+?)\s*\[', entry)
+
+        if not url_match:
+            logger.warning("Phase 2.6: Could not parse URL from entry: %s", entry)
+            return
+
+        hv_url = url_match.group(1)
+        hv_title = title_match.group(1).strip() if title_match else f"Secondary_Crawl_{index}"
+
+        clean_title = re.sub(r'[^\w\s-]', '', hv_title).strip().replace(' ', '_')
+        if not clean_title:
+            clean_title = f"Secondary_Crawl_{index}"
+
+        print(f"PROGRESS: Phase 2.6 — crawling [{index}] {hv_url}", flush=True)
+
+        url_raw_md = deep_crawl_urls([hv_url])
+        if not url_raw_md or not url_raw_md.strip():
+            logger.warning("Phase 2.6: empty scrape for %s — skipping.", hv_url)
+            print(f"PROGRESS: Phase 2.6 — [{index}] empty scrape, skipped.", flush=True)
+            return
+
+        # ── Task 3: Anti-bot / empty-payload ingestion guard ─────────────
+        _ANTIBOT_INDICATORS = (
+            "document_antibot",
+            "internal server error",
+            "scrape failed",
+            "access denied",
+            "403 forbidden",
+            "captcha",
+            "just a moment",
+            "checking your browser",
+        )
+        lowered_payload = url_raw_md.lower()
+        if any(indicator in lowered_payload for indicator in _ANTIBOT_INDICATORS):
+            print(f"[Crawl Skipped] Anti-bot detected for URL: {hv_url}", flush=True)
+            logger.warning("Phase 2.6: anti-bot blockade detected for %s — skipping.", hv_url)
+            return
+
+        print(f"PROGRESS: Phase 2.6 — refining [{index}] {clean_title}", flush=True)
+        url_refined = refine_scraped_data(url_raw_md)
+
+        # Save with _URLRefiner suffix for Phase 4 visibility and PROJECT_SPEC compliance
+        topic_with_suffix = f"{primary_keyword}_{clean_title}_URLRefiner"
+        path = save_markdown("agent_scrapes", topic_with_suffix, url_refined)
+        resolved_path = path.resolve()
+
+        # Thread-safe update of shared mutable lists using actual resolved path
+        with lock:
+            saved_files.append(str(resolved_path))
+            current_run_files.append(resolved_path)
+
+        print(f"PROGRESS: Phase 2.6 — [{index}] ✓ saved {path.name}", flush=True)
+        logger.info("Phase 2.6: refined and saved %s", path.name)
+
+    except Exception as e:
+        logger.warning("Phase 2.6: failed to process %s — %s", entry, e)
+        print(f"PROGRESS: Phase 2.6 — [{index}] ✗ error: {e}", flush=True)
 
 
 def execute(idea: str, url: str) -> dict:
     """
     Run the full research pipeline:
       Phase 1.5  — AI pre-processing (Gemini Flash)
-      Phase 2    — scrape & expand (using optimised keywords)
+      Phase 2    — scrape & expand (CONCURRENT: Social + Academic + Wiki)
       Phase 2.5  — deep crawl + noise refinement (Gemini 2.5 Pro)
-      Phase 2.6  — recursive URL extraction & per-URL refinement
+      Phase 2.6  — recursive URL extraction & per-URL refinement (CONCURRENT)
       Phase 3    — synthesize & store to knowledge base
       Phase 4    — trigger graphify (Llama 4 Scout 10M context)
 
@@ -93,11 +201,13 @@ def execute(idea: str, url: str) -> dict:
 
     saved_files: list[str] = []
     current_run_files: list[Path] = []
+    lock = threading.Lock()
     ensure_structure()
 
     # ── Phase 1.5: AI Pre-processing ─────────────────────────────────────
     # Produces: core_context, search_keywords, extracted_urls, user_intent
     # These are in-memory variables for this run only.
+    print("PROGRESS: Phase 1.5 — analyzing seed input...", flush=True)
     seed_analysis = analyze_seed(raw_seed)
 
     core_context: str = seed_analysis.get("core_context", raw_seed)
@@ -111,36 +221,71 @@ def execute(idea: str, url: str) -> dict:
 
     # Use the first optimised keyword for downstream scrapers
     primary_keyword = search_keywords[0] if search_keywords else raw_seed
+    print("PROGRESS: Phase 1.5 — ✓ complete.", flush=True)
 
-    # ── Phase 2: Context Expansion (keyword-driven) ──────────────────────
+    # ── Phase 2: Context Expansion (CONCURRENT) ──────────────────────────
     # Raw outputs are collected into LOCAL variables then WRITTEN TO DISK.
     # They serve as inputs to the DataRefiner and to Graphify only.
     # They must NOT be appended directly to full_context.
 
-    # 1. Advanced Firecrawl (crawl target URLs or search with keywords)
+    # Step 1: Firecrawl advanced search runs first (sequential)
+    # because it depends on extracted_urls from Phase 1.5
+    print("PROGRESS: Phase 2 — running Firecrawl advanced search...", flush=True)
     web_md: str = firecrawl_advanced_search(search_keywords, extracted_urls)
     path = save_markdown("agent_scrapes", primary_keyword, web_md)
     saved_files.append(str(path))
+    print("PROGRESS: Phase 2 — ✓ Firecrawl complete.", flush=True)
 
-    # 2. Social threads → raw_ingestion (using optimised keyword)
-    social_md: str = search_social_threads(primary_keyword)
+    # Step 2: Social + Academic + Wiki run in PARALLEL
+    print("PROGRESS: Phase 2 — launching parallel scrapers (Social, Academic, Wiki)...", flush=True)
+
+    social_md: str = ""
+    wiki_md: str = ""
+    academic_md: str = ""
+
+    with ThreadPoolExecutor(max_workers=_PHASE2_WORKERS, thread_name_prefix="phase2") as pool:
+        future_social = pool.submit(search_social_threads, primary_keyword)
+        future_academic = pool.submit(search_academic_papers, primary_keyword)
+        future_wiki = pool.submit(get_wiki_summary, primary_keyword)
+
+        futures_map = {
+            future_social: "Social",
+            future_academic: "Academic",
+            future_wiki: "Wiki",
+        }
+
+        for future in as_completed(futures_map):
+            label = futures_map[future]
+            try:
+                result = future.result()
+                if label == "Social":
+                    social_md = result
+                elif label == "Academic":
+                    academic_md = result
+                else:
+                    wiki_md = result
+                print(f"PROGRESS: Phase 2 — ✓ {label} scraper complete.", flush=True)
+            except Exception as e:
+                logger.error("Phase 2 %s scraper failed: %s", label, e)
+                print(f"PROGRESS: Phase 2 — ✗ {label} scraper error: {e}", flush=True)
+
+    # Save Phase 2 results to disk
     path = save_markdown("raw_ingestion", primary_keyword, social_md)
     saved_files.append(str(path))
 
-    # 3. Wikipedia → agent_scrapes
-    wiki_md: str = get_wiki_summary(primary_keyword)
     path = save_markdown("agent_scrapes", primary_keyword, wiki_md)
     saved_files.append(str(path))
     current_run_files.append(path.resolve())
 
-    # 4. Academic papers → agent_scrapes (using optimised keyword)
-    academic_md: str = search_academic_papers(primary_keyword)
     path = save_markdown("agent_scrapes", primary_keyword, academic_md)
     saved_files.append(str(path))
     current_run_files.append(path.resolve())
 
+    print("PROGRESS: Phase 2 — ✓ all scrapers complete.", flush=True)
+
     # ── Phase 2.5: Deep Crawl + Noise Refinement ─────────────────────────
     # Collect all discovered URLs from Phase 1.5 for deep crawling.
+    print("PROGRESS: Phase 2.5 — deep crawling discovered URLs...", flush=True)
     discovered_urls: list = list(extracted_urls)
 
     deep_crawl_md: str = deep_crawl_urls(discovered_urls)
@@ -155,36 +300,51 @@ def execute(idea: str, url: str) -> dict:
     )
 
     # refined_data is the sole output of DataRefiner for this run.
+    print("PROGRESS: Phase 2.5 — refining raw corpus via Gemini 2.5 Pro...", flush=True)
     refined_data: str = refine_scraped_data(raw_corpus)
 
     # Save the primary refinement to disk for Graphify.
     path = save_markdown("agent_scrapes", primary_keyword, refined_data)
     saved_files.append(str(path))
     current_run_files.append(path.resolve())
+    print("PROGRESS: Phase 2.5 — ✓ refinement complete.", flush=True)
 
     # ── Phase 2.6: Recursive URL Extraction & Per-URL Refinement ─────────
     # Parse the refined output for high-value URLs identified by the refiner,
     # scrape each one individually, refine it, and add to the input set.
-    high_value_urls = _extract_high_value_urls(refined_data)
+    print("PROGRESS: Phase 2.6 — extracting high-value URLs...", flush=True)
+    high_value_urls = asyncio.run(_extract_high_value_urls(refined_data))
+    print(f"PROGRESS: Phase 2.6 — found {len(high_value_urls)} URLs for concurrent crawling.", flush=True)
     logger.info("Phase 2.6: found %d high-value URLs for recursive refinement.", len(high_value_urls))
 
-    for hv_url in high_value_urls:
-        try:
-            url_raw_md = deep_crawl_urls([hv_url])
-            if not url_raw_md or not url_raw_md.strip():
-                logger.warning("Phase 2.6: empty scrape for %s — skipping.", hv_url)
-                continue
+    if high_value_urls:
+        with ThreadPoolExecutor(
+            max_workers=_PHASE26_MAX_WORKERS,
+            thread_name_prefix="phase26",
+        ) as pool:
+            futures = {
+                pool.submit(
+                    _refine_single_url,
+                    i,
+                    entry,
+                    primary_keyword,
+                    saved_files,
+                    current_run_files,
+                    lock,
+                ): i
+                for i, entry in enumerate(high_value_urls)
+            }
 
-            url_refined = refine_scraped_data(url_raw_md)
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.warning("Phase 2.6 worker [%d] raised: %s", idx, e)
 
-            # Save with _URLRefiner suffix for clear provenance
-            path = save_markdown("agent_scrapes", f"{primary_keyword}_URLRefiner", url_refined)
-            saved_files.append(str(path))
-            current_run_files.append(path.resolve())
-            logger.info("Phase 2.6: refined and saved %s", path.name)
-
-        except Exception as e:
-            logger.warning("Phase 2.6: failed to process %s — %s", hv_url, e)
+        print(f"PROGRESS: Phase 2.6 — ✓ all {len(high_value_urls)} URLs processed.", flush=True)
+    else:
+        print("PROGRESS: Phase 2.6 — no URLs to process, skipping.", flush=True)
 
     # ── Phase 3: Synthesis & Storage ─────────────────────────────────────
     # STRICT CONTEXT ENFORCEMENT:
@@ -192,6 +352,7 @@ def execute(idea: str, url: str) -> dict:
     #   • core_context  — Phase 1.5 InputAnalyzer output (current run)
     #   • user_intent   — Phase 1.5 InputAnalyzer output (current run)
     #   • refined_data  — Phase 2.5 DataRefiner output   (current run)
+    print("PROGRESS: Phase 3 — synthesizing research context...", flush=True)
     full_context: str = (
         f"## Core Context (from AI pre-processing)\n{core_context}\n\n"
         f"## User Intent\n{user_intent}\n\n"
@@ -203,8 +364,10 @@ def execute(idea: str, url: str) -> dict:
     path = save_markdown("processed_summaries", primary_keyword, synthesis)
     saved_files.append(str(path))
     current_run_files.append(path.resolve())
+    print("PROGRESS: Phase 3 — ✓ synthesis saved.", flush=True)
 
     # ── Phase 4: Knowledge Graph Generation ──────────────────────────────
+    print("PROGRESS: Phase 4 — generating knowledge graph...", flush=True)
     graphify_output = ""
     graphify_error = None
     try:
@@ -215,6 +378,11 @@ def execute(idea: str, url: str) -> dict:
         graphify_error = str(e)
 
     graph_path_abs = get_kb_root() / "graphify-out" / "graph.html"
+
+    if graphify_error:
+        print(f"PROGRESS: Phase 4 — ✗ graphify error: {graphify_error}", flush=True)
+    else:
+        print("PROGRESS: Phase 4 — ✓ knowledge graph generated.", flush=True)
 
     # Swift bridging contract — JSON stdout schema must remain unchanged.
     return {

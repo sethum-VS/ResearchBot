@@ -3,7 +3,8 @@ google-genai
 tavily-python
 requests
 python-dotenv
-firecrawl-py
+firecrawl-py>=2.0.0
 openai
 fastapi
 uvicorn
+tenacity

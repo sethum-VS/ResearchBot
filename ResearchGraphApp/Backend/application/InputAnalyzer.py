@@ -8,6 +8,7 @@ import os
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 
 # ── Pydantic Schema for Structured Output ────────────────────────────────────
@@ -33,8 +34,17 @@ class SeedAnalysis(BaseModel):
     )
 
 
-# ── Analyzer Function ────────────────────────────────────────────────────────
+def _is_resource_exhausted(exc: Exception) -> bool:
+    """Check if the exception is a 429 ResourceExhausted."""
+    exc_str = str(exc).lower()
+    return "429" in exc_str or "resourceexhausted" in exc_str or "resource_exhausted" in exc_str
 
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception(_is_resource_exhausted)
+)
 def analyze_seed(raw_input: str) -> dict:
     """
     Pass the user's raw seed text through Gemini 2.5 Flash to extract

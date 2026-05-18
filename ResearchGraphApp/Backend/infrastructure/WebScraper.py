@@ -7,9 +7,16 @@ Provides two modes:
   1. scrape_url_to_markdown() — single URL scrape (legacy / fallback)
   2. firecrawl_advanced_search() — keyword search + deep crawl powered
      by Phase 1.5 InputAnalyzer output
+
+Concurrency: deep_crawl_urls() uses ThreadPoolExecutor to scrape multiple
+URLs in parallel (max_workers=5) with flush=True progress streaming.
 """
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from firecrawl import FirecrawlApp
+
+_CRAWL_MAX_WORKERS = 5
 
 
 def _get_app() -> FirecrawlApp:
@@ -23,8 +30,8 @@ def scrape_url_to_markdown(url: str) -> str:
     """Scrape a URL and return its content as Markdown using local Firecrawl."""
     try:
         app = _get_app()
-        result = app.scrape_url(url, params={'formats': ['markdown']})
-        return result.get('markdown', f"# No content extracted from {url}")
+        result = app.scrape(url, formats=['markdown'])
+        return result.markdown if result.markdown else f"# No content extracted from {url}"
     except Exception as e:
         return f"# Scrape Error\nFailed to scrape `{url}` locally: {e}"
 
@@ -56,10 +63,24 @@ def firecrawl_advanced_search(
                     'scrapeOptions': {'formats': ['markdown']},
                 },
             )
-            for page in (crawl_result.get('data') or []):
-                md = page.get('markdown', '')
+            data_list = getattr(crawl_result, 'data', None)
+            if data_list is None and hasattr(crawl_result, 'get'):
+                data_list = crawl_result.get('data') or []
+                
+            for page in data_list:
+                md = getattr(page, 'markdown', None)
+                if md is None and hasattr(page, 'get'):
+                    md = page.get('markdown', '')
+                    
                 if md:
-                    source = page.get('metadata', {}).get('sourceURL', 'unknown')
+                    meta = getattr(page, 'metadata', None)
+                    if meta is None and hasattr(page, 'get'):
+                        meta = page.get('metadata', {})
+                        
+                    source = getattr(meta, 'sourceURL', getattr(meta, 'source_url', 'unknown')) if meta else 'unknown'
+                    if source == 'unknown' and hasattr(meta, 'get'):
+                        source = meta.get('sourceURL', meta.get('source_url', 'unknown'))
+                        
                     sections.append(f"<!-- source: {source} -->\n{md}")
 
         # Path B: Keyword-driven web search
@@ -85,14 +106,28 @@ def firecrawl_advanced_search(
     return "\n\n---\n\n".join(sections)
 
 
-# ── Deep Crawl Individual URLs ───────────────────────────────────────────────
+# ── Deep Crawl Individual URLs (Concurrent) ──────────────────────────────────
+
+def _scrape_single_url(url: str) -> str | None:
+    """Scrape one URL; returns Markdown or None on failure."""
+    try:
+        app = _get_app()
+        result = app.scrape(url, formats=['markdown'])
+        md = result.markdown
+        if md:
+            return f"<!-- source: {url} -->\n{md}"
+        return None
+    except Exception as e:
+        return f"# Deep Crawl Error\nFailed to scrape `{url}`: {e}"
+
 
 def deep_crawl_urls(urls: list[str]) -> str:
     """
-    Scrape each URL individually and return concatenated Markdown.
+    Scrape each URL in parallel and return concatenated Markdown.
 
     Unlike firecrawl_advanced_search (which crawls from a root),
-    this function performs a targeted single-page scrape per URL.
+    this function performs a targeted single-page scrape per URL
+    using a ThreadPoolExecutor for concurrency.
 
     Parameters
     ----------
@@ -105,16 +140,25 @@ def deep_crawl_urls(urls: list[str]) -> str:
     if not urls:
         return ""
 
-    app = _get_app()
     sections: list[str] = []
 
-    for url in urls:
-        try:
-            result = app.scrape_url(url, params={'formats': ['markdown']})
-            md = result.get('markdown', '')
-            if md:
-                sections.append(f"<!-- source: {url} -->\n{md}")
-        except Exception as e:
-            sections.append(f"# Deep Crawl Error\nFailed to scrape `{url}`: {e}")
+    if len(urls) == 1:
+        # Fast path: skip executor overhead for a single URL
+        result = _scrape_single_url(urls[0])
+        return result or ""
+
+    with ThreadPoolExecutor(max_workers=min(_CRAWL_MAX_WORKERS, len(urls))) as pool:
+        future_to_url = {pool.submit(_scrape_single_url, u): u for u in urls}
+
+        for future in as_completed(future_to_url):
+            url = future_to_url[future]
+            try:
+                result = future.result()
+                if result:
+                    sections.append(result)
+                print(f"PROGRESS: deep_crawl — ✓ scraped {url}", flush=True)
+            except Exception as e:
+                sections.append(f"# Deep Crawl Error\nFailed to scrape `{url}`: {e}")
+                print(f"PROGRESS: deep_crawl — ✗ error on {url}: {e}", flush=True)
 
     return "\n\n---\n\n".join(sections)

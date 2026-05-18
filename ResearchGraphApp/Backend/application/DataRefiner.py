@@ -2,9 +2,14 @@
 DataRefiner.py — Phase 2.5: Noise Reduction & Structured Refining.
 Uses Gemini 2.5 Pro's 1M token context window to filter noise from
 raw web and social scrapes, verify facts, and re-organize data.
+
+Thread-safety: Uses a module-level genai.Client singleton to avoid
+redundant client construction under concurrent Phase 2.6 workloads.
 """
 
 import os
+import threading
+
 from google import genai
 from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
@@ -23,6 +28,29 @@ REFINER_SYSTEM_INSTRUCTION = (
     "Output a clean, structured Markdown summary that does not exceed 60,000 tokens."
 
 )
+
+# ── Shared Client Singleton ──────────────────────────────────────────────────
+_client: genai.Client | None = None
+_client_lock = threading.Lock()
+
+
+def _get_client() -> genai.Client:
+    """Return a shared genai.Client, creating it once (thread-safe)."""
+    global _client
+    if _client is not None:
+        return _client
+
+    with _client_lock:
+        # Double-check under lock
+        if _client is not None:
+            return _client
+
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
+        if not project_id:
+            raise RuntimeError("GOOGLE_CLOUD_PROJECT_ID not set.")
+
+        _client = genai.Client(vertexai=True, project=project_id, location="global")
+        return _client
 
 
 def is_resource_exhausted(exc: Exception) -> bool:
@@ -54,15 +82,11 @@ def refine_scraped_data(raw_data: str) -> str:
     Returns:
         Cleaned, re-organized Markdown string.
     """
-    project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
-    if not project_id:
-        return "# Refiner Error\nGOOGLE_CLOUD_PROJECT_ID not set."
-
     if not raw_data or not raw_data.strip():
         return "# Refiner Warning\nNo raw data provided for refinement."
 
     try:
-        client = genai.Client(vertexai=True, project=project_id, location="global")
+        client = _get_client()
         model = "gemini-2.5-pro"
 
         config = types.GenerateContentConfig(
@@ -77,5 +101,7 @@ def refine_scraped_data(raw_data: str) -> str:
             config=config,
         )
         return response.text or "# Refiner Warning\nGemini returned an empty response."
+    except RuntimeError as e:
+        return f"# Refiner Error\n{e}"
     except Exception as e:
         return f"# Refiner Error\nGemini API call failed: {e}"
