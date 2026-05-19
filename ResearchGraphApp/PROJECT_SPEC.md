@@ -1,66 +1,120 @@
 # Project Specification: Autonomous Research Graph (macOS)
 
 ## 1. Project Vision
-This project is a native macOS application designed to automate deep-dive domain research. It ingest seeds (URLs, ideas, or files), expands them using an autonomous Python-based agent, synthesizes the findings into local Markdown files, and generates an interactive, queryable knowledge graph using Graphify. 
-
-The application serves as an always-on "research co-pilot," blending native UI performance with local, privacy-first data processing.
+An **Academic Gap-Hunting Engine** designed to automate deep-dive domain research for university-level Final Year Projects (FYP). The system identifies "Structural Holes" in existing literature by correlating societal problems (extracted from social media) with academic limitations (from peer-reviewed papers), providing a clear path for a novel technical contribution.
 
 ## 2. Technology Stack & Environment
-* **Target Platform:** macOS (optimized for Apple Silicon).
-* **Frontend UI:** SwiftUI (App lifecycle, Menu Bar integration, WKWebView for graph rendering).
+* **Platform:** macOS (optimized for Apple Silicon).
+* **Frontend UI:** SwiftUI (Modern `@Observable` state management, WKWebView for visualization).
 * **Backend Orchestrator:** Python 3.10+ (Subprocess execution from Swift).
-* **AI Models:** Google Gen AI SDK (Vertex AI ADC) using Gemini 2.5 Flash (Routing/Parsing) and Gemini 2.5 Pro (Synthesis).
-* **Knowledge Graph Engine:** Graphify (`graphifyy`).
-* **Data Ingestion APIs:** Tavily Search API (Social/Academic), Local Firecrawl Docker Container (Web Scraping), MediaWiki REST API (Wiki Context).
+* **AI Models:**
+    * **Gemini 2.5 Flash:** Input analysis, lead extraction, and high-speed URL parsing.
+    * **Gemini 2.5 Pro:** Data refinement, noise reduction, and final synthesis (utilizing 64k output window).
+    * **Llama 4 Scout:** 10M-context Knowledge Graph generation via Vertex AI Model-as-a-Service (MaaS) mapped locally via VertexProxy.
+* **Data Ingestion APIs:**
+    * **Firecrawl:** Local Docker container for deep web crawling (`/crawl` and `/scrape`).
+    * **Semantic Scholar API:** Direct extraction of academic citations, limitations, and future work.
+    * **Tavily API:** Discovery of social leads (Reddit/X) and academic fallbacks.
+    * **MediaWiki API:** Foundational definitions and Wiki context.
+
+---
 
 ## 3. Core Architecture & Data Flow
-The system operates in a strict, sequential pipeline. Antigravity must respect these boundaries and not conflate frontend state with backend script logic.
+The system operates as a recursive, concurrent pipeline with strict session isolation.
 
-* **Phase 1: Dual-Entry Ingestion (SwiftUI -> Python)**
-    * User inputs a raw text idea or a URL via the SwiftUI interface.
-    * SwiftUI passes this data as arguments to a background Python process (`main.py`).
-* **Phase 1.5: AI Pre-processing (Python)**
-    * The raw input is routed to `InputAnalyzer.py` powered by Gemini 2.5 Flash.
-    * The model parses the input into a strict Pydantic schema extracting: `core_context`, `search_keywords`, `extracted_urls`, and `user_intent`.
-* **Phase 2: Context Expansion & Scraping (Python)**
-    * **Web Scraper:** Uses Firecrawl's advanced `/search` or `/crawl` endpoint (running locally via Docker) driven by the extracted keywords and URLs.
-    * **Social Scraper:** Uses Tavily API (scoped to `reddit.com`, `x.com`) modified to specifically hunt for high-engagement discussions based on the primary search keyword.
-    * **Wiki Context:** Utilizes the MediaWiki Action API to extract structured background data and definitions, saved as Markdown.
-    * **Academic Deep Dive:** Uses Tavily API (scoped to academic domains like `arxiv.org`, `scholar.google.com`) to extract methodologies and findings into Markdown.
-* **Phase 3: Synthesis & Storage (Python -> File System)**
-    * `AgentSynthesizer.py` (Gemini 2.5 Pro) synthesizes the scraped context, anchored by the `core_context` and `user_intent` generated in Phase 1.5, to identify "Competitors" and "Research Gaps."
-    * All outputs are saved strictly as `.md` files in the local `/research_knowledge_base` directory.
+```mermaid
+graph TD
+    A[SwiftUI Frontend] -->|Spawn Subprocess| B[IngestSeedUseCase.py]
+    B -->|Phase 1 & 1.5| C[InputAnalyzer.py]
+    C -->|Analyze Intent| D[Gemini 2.5 Flash]
+    
+    B -->|Phase 2: Parallel Discovery| E[Scrapers: Social, Academic, Wiki]
+    E -->|Wiki API| F1[Wikipedia Scrapes]
+    E -->|Tavily/Semantic Scholar| F2[Academic/Social Leads]
+    
+    B -->|Phase 2.5: Noise Refinement| G[DataRefiner.py]
+    G -->|Extract High-Value URLs| H[Gemini 2.5 Pro]
+    
+    B -->|Phase 2.6: Deep-Crawl| I[Firecrawl + URL Refinement]
+    I -->|Refined Pages| J[_URLRefiner.md Files]
+    
+    B -->|Phase 3: Synthesis| K[AgentSynthesizer.py]
+    K -->|Synthesize Gap| L[Gemini 2.5 Pro]
+    
+    B -->|Phase 4: KG Pipeline| M[GraphifyRunner.py]
+    M -->|Micro-Chunking budget: 1500| N[Llama 4 Scout via VertexProxy]
+    N -->|Generate Outputs| O[graphify-out/]
+    O -->|Visualize| P[SwiftUI WKWebView]
+```
+
+### Phase 1 & 1.5: Ingestion & Intent Analysis
+* SwiftUI passes raw input to `InputAnalyzer.py`.
+* Gemini 2.5 Flash generates `core_context`, `search_keywords`, and `user_intent`.
+
+### Phase 2: Discovery Scraping (Concurrent Execution)
+* **Social Scraper:** Captures Reddit/X threads; extracts "leads" (Wikipedia/GitHub/Research terms).
+* **Academic Scraper:** Queries Semantic Scholar/arXiv for the top 20 papers; extracts Current Work, Limitations, and Citations.
+* **Wiki Context:** Extracts background logic from MediaWiki using the standard `WikiAPI`.
+
+### Phase 2.5: Noise Reduction & Primary Refinement
+* **DataRefiner:** Ingests raw Discovery data into Gemini 2.5 Pro.
+* **Logic:** Strips ads and fluff; organizes findings into a "Research Ledger" with source tags.
+* **Output:** Generates the "High-Value URLs for Next Crawl Phase."
+
+### Phase 2.6: Recursive Deep-Crawl & URL Refinement
+* **URL Extraction:** Gemini 2.5 Flash extracts URLs from Phase 2.5.
+* **Recursive Loop & Queue Registration:** High-value discovered URLs are deep-crawled via Firecrawl and individually refined via Gemini 2.5 Pro.
+* **Data Leak Mitigation:** Each scraped and refined markdown file is saved to `/research_knowledge_base/agent_scrapes` and immediately registered via absolute path resolution (`path.resolve()`) into the dynamic run queue (`current_run_files`). This ensures 100% corpus capture during Phase 4.
+
+### Phase 3: Synthesis & Storage
+* **AgentSynthesizer:** Ingests `core_context`, `user_intent`, and `refined_data`.
+* **Output:** Strictly follows the University Rubric: `## Problem Background`, `## Existing Solutions`, `## Methodological Weaknesses (The Gap)`, and `## Proposed Novelty`.
+* Raw data and syntheses are saved strictly as `.md` files in the local `/research_knowledge_base` directory structure:
+    ```
     /research_knowledge_base
-        ├── /raw_ingestion (Social/Reddit/Twitter dumps)
-        ├── /agent_scrapes (Wiki, Academic, and Web Markdown)
-        └── /processed_summaries (Gemini 2.5 Pro final synthesis)
-* **Phase 4: Knowledge Graph Generation (Python Shell)**
-    * Python triggers the `graphify ../research_knowledge_base` shell command via `subprocess`.
-    * Graphify outputs `graph.html`, `GRAPH_REPORT.md`, and `graph.json` into the `graphify-out/` directory.
-    * The Python script completes and returns a structured JSON success payload to stdout.
-* **Phase 5: Visual Presentation (SwiftUI)**
-    * SwiftUI detects the successful process exit.
-    * A `WKWebView` component loads `graphify-out/graph.html` to provide interactive visualization.
+        ├── /raw_ingestion (Reddit/Twitter dumps)
+        ├── /agent_scrapes (Raw Markdown from websites & URLRefiner outputs)
+        ├── /processed_summaries (Intermediate JSON files)
+    ```
 
-## 4. Development Rules for Google Antigravity
-When operating in this repository, Google Antigravity MUST adhere to the following directives:
+### Phase 4: Knowledge Graph Generation (Micro-Extraction Protocol)
+* **Session Isolation:** A temporary directory is constructed containing strictly the current execution run's files copied from `processed_summaries`, `_urlrefiner` files, and validated scrapes.
+* **Micro-Extraction Chunking:** Llama 4 Scout processes the entire filtered corpus via the local VertexProxy. The token budget parameter is tuned to `--token-budget 1500` (down from `8000`). This splits the corpus into small semantic windows, forcing the model to perform highly granular micro-extraction of niche gaps, definitions, and relationships rather than macro-summarizing the entire corpus into a sparse handful of nodes.
+* **Header Matching Bugfix:** The compilation step accurately matches both `# Wikipedia:` and `# Wiki:` headers, preventing scrape omission during folder synchronization.
+* **Visualization Output:** Graphify compiles the extracted entities and links into `graph.json`, `graph.html`, and `GRAPH_REPORT.md`, moving them to `/research_knowledge_base/graphify-out/` where they are loaded into the SwiftUI WKWebView.
 
-### A. Code Generation Rules
-1.  **Strict Separation:** Do not mix Python logic into Swift files or vice versa. Swift handles UI and process management; Python handles all API calls, scraping, and LLM orchestration.
-2.  **SwiftUI Standards:** Use modern SwiftUI state management (`@Observable`, `@State`). Avoid outdated Combine patterns unless strictly necessary for Python process bridging. 
-3.  **Python Standards:** Write modular Python scripts. Ensure all dependencies are documented in `requirements.txt`.
-4.  **Error Handling:** Python scripts must return clear exit codes and JSON-formatted error strings to stdout so the Swift `Process()` can display native UI alerts on failure. Never crash silently.
+---
 
-### B. Graphify Integration Rules
-1.  **Always Consult the Graph:** Before proposing architectural changes or answering questions about the existing codebase, Antigravity MUST read `graphify-out/GRAPH_REPORT.md` to understand current file connections.
-2.  **Graphify Hook:** Ensure the `graphify antigravity install` hook is active. 
+## 4. Performance & High-Availability Protocols
 
-### C. File System Safety
-1.  Never delete files in the `/research_knowledge_base` directory without explicit user permission.
-2.  Always append or create new files with timestamped naming conventions.
+### 1. Multi-Region Fallover Pools (Rate-Limit Mitigation)
+To prevent API interruption from `429 RESOURCE_EXHAUSTED` errors during parallel processing, both `DataRefiner.py` and `AgentSynthesizer.py` employ a Multi-Region Redundancy Pool matching `VertexProxy.STABLE_REGIONS`. If the primary global endpoint fails, the pipeline cycles sequentially through:
+* `europe-west4`
+* `us-east4`
+* `asia-northeast1`
+* `us-central1`
 
-## 5. Definition of Done for Features
-A new feature is only considered complete when:
-1. The SwiftUI interface is responsive and non-blocking (process runs on background threads).
-2. The Python script executes without environment path errors.
-3. The resulting data is successfully ingested into the Graphify pipeline and visually updates in the `WKWebView`.
+### 2. Thread-Level Concurrency Enforcements
+* **Phase 2 Scrapers:** Executed concurrently via `ThreadPoolExecutor` (Max Workers capped to protect API rate limits).
+* **Phase 2.6 Deep Scrapers:** Executed concurrently to parse and refine multiple crawled pages simultaneously.
+
+### 3. Swift Bridging & Standard Output Stream
+* Python scripts stream structured logs directly to `stdout`.
+* The final execution outputs the SwiftUI bridging payload wrapped in explicit JSON tokens: `---PIPELINE_RESULT_START---` and `---PIPELINE_RESULT_END---`.
+
+---
+
+## 5. Development & Contribution Rules
+
+### Code Generation Rules
+1. **Strict Separation:** Swift handles UI layout and process state; Python manages all API connections, model querying, scraping, and knowledge graph orchestration. Do not mix environments.
+2. **SwiftUI State Standards:** Use modern `@Observable` state management. Direct standard output monitoring is used for live console updates in the app UI.
+3. **No Unapproved Commits:** Under **RULE[user_global]**, absolutely no git commits or pushes may be executed without explicit user authorization in the chat interface.
+
+### Graphify Integration Rules
+1. **Report Monitoring:** Antigravity must consult `/research_knowledge_base/graphify-out/GRAPH_REPORT.md` to identify structural holes, communities, and highly connected central nodes before advising on literature positioning or codebase modifications.
+2. **Incremental Updates:** Keep the graphify environment optimized. Run `graphify update` locally for structural additions without incurring extraction model cost.
+
+### File System Integrity
+1. **Folder Preservations:** The clean utilities must preserve the top-level research directory architecture while deep cleaning inner files.
+2. **No Data Deletion:** Do not purge or modify historical research ledgers unless explicitly requested by the user.

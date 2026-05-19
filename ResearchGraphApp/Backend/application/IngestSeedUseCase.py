@@ -252,6 +252,7 @@ def execute(idea: str, url: str) -> dict:
     web_md: str = firecrawl_advanced_search(search_keywords, extracted_urls)
     path = save_markdown("agent_scrapes", primary_keyword, web_md)
     saved_files.append(str(path))
+    current_run_files.append(path.resolve())
     print("PROGRESS: Phase 2 — ✓ Firecrawl complete.", flush=True)
 
     # Step 2: Social + Academic + Wiki run in PARALLEL
@@ -310,6 +311,7 @@ def execute(idea: str, url: str) -> dict:
     if deep_crawl_md:
         path = save_markdown("agent_scrapes", primary_keyword, deep_crawl_md)
         saved_files.append(str(path))
+        current_run_files.append(path.resolve())
 
     # Combine ALL raw data collected in this run into a single corpus for
     # the DataRefiner.  Only in-memory strings from this execution are joined.

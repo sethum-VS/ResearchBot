@@ -351,7 +351,7 @@ def _prepare_filtered_kb(kb_path: Path, current_run_files: list[Path]) -> Path:
             # Check file content for Academic Data Refinement or Wiki prefix
             try:
                 header = f.read_text(encoding="utf-8")[:200]
-                if header.startswith("# Wiki:") or "Academic Data Refin" in header:
+                if header.startswith("# Wikipedia:") or header.startswith("# Wiki:") or "Academic Data Refin" in header:
                     include = True
             except OSError:
                 pass
@@ -422,7 +422,7 @@ def run_graphify(current_run_files: list[Path], kb_path: Path | None = None) -> 
                 "graphify", "extract", str(filtered_dir),
                 "--backend", "ollama",
                 "--model", "llama-4-scout",
-                "--token-budget", "8000",
+                "--token-budget", "1500",
             ],
             capture_output=True,
             text=True,

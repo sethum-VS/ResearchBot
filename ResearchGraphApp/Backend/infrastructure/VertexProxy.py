@@ -519,6 +519,13 @@ def proxy(path: str, request: Request, body: dict = Body(...)):
             resolved_model,
         )
 
+    # --- Estimate Token Usage -------------------------------------------
+    # Use character length / 4 as a naive but functional estimator
+    # to prevent Graphify from raising misleading VRAM warnings.
+    prompt_chars = sum(len(msg.get("content", "")) for msg in body.get("messages", []))
+    estimated_prompt_tokens = max(1, prompt_chars // 4)
+    estimated_completion_tokens = max(1, len(text_out or "") // 4)
+
     # --- Return OpenAI-compatible response ------------------------------
     return JSONResponse(content={
         "id": f"proxy-{int(time.time())}",
@@ -536,8 +543,8 @@ def proxy(path: str, request: Request, body: dict = Body(...)):
             }
         ],
         "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
+            "prompt_tokens": estimated_prompt_tokens,
+            "completion_tokens": estimated_completion_tokens,
+            "total_tokens": estimated_prompt_tokens + estimated_completion_tokens,
         },
     })

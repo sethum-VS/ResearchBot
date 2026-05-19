@@ -145,9 +145,9 @@ def refine_scraped_data(raw_data: str) -> str:
             "Attempting regional failover through STABLE_REGIONS...",
             primary_exc,
         )
+        last_exc = primary_exc
 
     # ── Regional failover: cycle through STABLE_REGIONS ──────────────────
-    last_exc = primary_exc
     for region in _STABLE_REGIONS:
         try:
             logger.info("DataRefiner: regional failover → %s", region)
