@@ -154,7 +154,25 @@ def _refine_single_url(
             return
 
         print(f"PROGRESS: Phase 2.6 — refining [{index}] {clean_title}", flush=True)
-        url_refined = refine_scraped_data(url_raw_md)
+
+        # ── Fail-fast guard: catch DataRefiner exhaustion ────────────
+        # If all regional endpoints are exhausted (429), DataRefiner
+        # raises RuntimeError.  We catch it HERE so that:
+        #   a) NO corrupt markdown file is written to agent_scrapes/
+        #   b) The remaining thread workers continue processing
+        try:
+            url_refined = refine_scraped_data(url_raw_md)
+        except RuntimeError as refine_err:
+            print(
+                f"[Crawl Failed] Skipping file generation for URL "
+                f"due to API exhaustion: {hv_url} — {refine_err}",
+                flush=True,
+            )
+            logger.warning(
+                "Phase 2.6 [%d]: DataRefiner exhausted all regions for %s — %s",
+                index, hv_url, refine_err,
+            )
+            return  # Skip file writing entirely
 
         # Save with _URLRefiner suffix for Phase 4 visibility and PROJECT_SPEC compliance
         topic_with_suffix = f"{primary_keyword}_{clean_title}_URLRefiner"
@@ -301,13 +319,30 @@ def execute(idea: str, url: str) -> dict:
 
     # refined_data is the sole output of DataRefiner for this run.
     print("PROGRESS: Phase 2.5 — refining raw corpus via Gemini 2.5 Pro...", flush=True)
-    refined_data: str = refine_scraped_data(raw_corpus)
 
-    # Save the primary refinement to disk for Graphify.
-    path = save_markdown("agent_scrapes", primary_keyword, refined_data)
-    saved_files.append(str(path))
-    current_run_files.append(path.resolve())
-    print("PROGRESS: Phase 2.5 — ✓ refinement complete.", flush=True)
+    # ── Fail-fast guard: catch DataRefiner exhaustion ────────────────
+    # If all Vertex AI regions return 429, DataRefiner raises RuntimeError.
+    # We catch it at the orchestrator level so NO corrupt markdown file is
+    # written.  The pipeline continues with whatever data is available,
+    # and Phase 3 synthesis receives an empty refinement note.
+    try:
+        refined_data: str = refine_scraped_data(raw_corpus)
+    except RuntimeError as refine_err:
+        print(
+            f"[Refinement Failed] Primary refinement exhausted all regions: {refine_err}",
+            flush=True,
+        )
+        logger.error("Phase 2.5: DataRefiner exhausted all regions — %s", refine_err)
+        refined_data = ""  # empty so synthesis runs with core_context + user_intent only
+
+    # Only save the refinement to disk if it produced real content.
+    if refined_data and refined_data.strip():
+        path = save_markdown("agent_scrapes", primary_keyword, refined_data)
+        saved_files.append(str(path))
+        current_run_files.append(path.resolve())
+        print("PROGRESS: Phase 2.5 — ✓ refinement complete.", flush=True)
+    else:
+        print("PROGRESS: Phase 2.5 — ⚠ refinement skipped (API exhaustion).", flush=True)
 
     # ── Phase 2.6: Recursive URL Extraction & Per-URL Refinement ─────────
     # Parse the refined output for high-value URLs identified by the refiner,
