@@ -54,6 +54,21 @@ logger = logging.getLogger(__name__)
 _PHASE2_WORKERS = 3        # Social, Academic, Wiki in parallel
 _PHASE26_MAX_WORKERS = 5   # Cap for recursive URL refinement
 
+# Mirrors DataRefiner / VertexProxy — regional failover when global 429s.
+_STABLE_REGIONS: list[str] = [
+    "europe-west4",
+    "us-east4",
+    "asia-northeast1",
+    "us-central1",
+]
+
+_URL_EXTRACT_PROMPT = (
+    "You are a data extraction specialist. Look at the provided research summary "
+    "and find the section regarding 'High-Value URLs for Next Crawl Phase'. "
+    "Extract every title and its associated URL. Format the output strictly as a "
+    "simple list of 'Title [URL]'. Return ONLY the list, with no preamble or explanation."
+)
+
 
 def _is_resource_exhausted(exc: Exception) -> bool:
     """Check if the exception is a 429 ResourceExhausted."""
@@ -61,44 +76,86 @@ def _is_resource_exhausted(exc: Exception) -> bool:
     return "429" in exc_str or "resourceexhausted" in exc_str or "resource_exhausted" in exc_str
 
 
+def _parse_url_extraction_response(response) -> list[str]:
+    """Turn Gemini response into a list of 'Title [URL]' lines."""
+    if not response or not response.text:
+        return []
+    return [line.strip() for line in response.text.strip().split("\n") if line.strip()]
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=2, max=10),
-    retry=retry_if_exception(_is_resource_exhausted)
+    retry=retry_if_exception(_is_resource_exhausted),
 )
+async def _call_flash_async(client: genai.Client, contents: str):
+    """Gemini 2.5 Flash call with tenacity retry on 429 only."""
+    return await client.aio.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=contents,
+    )
+
+
 async def _extract_high_value_urls(refined_text: str) -> list[str]:
     """
     Extract high-value URLs for next crawl using Gemini 2.5 Flash.
     Returns a list of strings in the format 'Title [URL]'.
+
+    Resilience: global endpoint first (3x retry on 429), then STABLE_REGIONS
+    failover — same pattern as DataRefiner / AgentSynthesizer.
     """
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
     if not project_id:
         logger.warning("GOOGLE_CLOUD_PROJECT_ID not set. Cannot extract URLs.")
         return []
 
+    if not refined_text or not refined_text.strip():
+        return []
+
+    contents = f"{_URL_EXTRACT_PROMPT}\n\n{refined_text}"
+    last_exc: Exception | None = None
+
+    # ── Primary: global endpoint ─────────────────────────────────────────
     try:
         client = genai.Client(vertexai=True, project=project_id, location="global")
-        prompt = (
-            "You are a data extraction specialist. Look at the provided research summary "
-            "and find the section regarding 'High-Value URLs for Next Crawl Phase'. "
-            "Extract every title and its associated URL. Format the output strictly as a "
-            "simple list of 'Title [URL]'. Return ONLY the list, with no preamble or explanation."
+        response = await _call_flash_async(client, contents)
+        return _parse_url_extraction_response(response)
+    except Exception as primary_exc:
+        print(
+            f"PROGRESS: Phase 2.6 — global endpoint failed ({primary_exc}). "
+            "Attempting regional failover...",
+            flush=True,
         )
-
-        # Call Gemini 2.5 Flash via google-genai SDK
-        response = await client.aio.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=f"{prompt}\n\n{refined_text}"
+        logger.warning(
+            "URL extraction: global endpoint failed (%s). Attempting regional failover...",
+            primary_exc,
         )
+        last_exc = primary_exc
 
-        if not response.text:
-            return []
+    # ── Regional failover ─────────────────────────────────────────────────
+    for region in _STABLE_REGIONS:
+        try:
+            print(f"PROGRESS: Phase 2.6 — regional failover → {region}", flush=True)
+            logger.info("URL extraction: regional failover → %s", region)
+            client = genai.Client(vertexai=True, project=project_id, location=region)
+            response = await _call_flash_async(client, contents)
+            lines = _parse_url_extraction_response(response)
+            if lines:
+                logger.info("URL extraction: regional failover SUCCESS → %s", region)
+                return lines
+            logger.warning("URL extraction: empty response on %s", region)
+        except Exception as region_exc:
+            print(f"PROGRESS: Phase 2.6 — region {region} failed: {region_exc}", flush=True)
+            logger.warning("URL extraction: region %s failed: %s", region, region_exc)
+            last_exc = region_exc
+            continue
 
-        return [line.strip() for line in response.text.strip().split('\n') if line.strip()]
-
-    except Exception as e:
-        logger.error("Failed to extract URLs via LLM: %s", e)
-        return []
+    logger.error(
+        "Failed to extract URLs via LLM after all regions (%s). Last error: %s",
+        ", ".join(_STABLE_REGIONS),
+        last_exc,
+    )
+    return []
 
 
 def _refine_single_url(
