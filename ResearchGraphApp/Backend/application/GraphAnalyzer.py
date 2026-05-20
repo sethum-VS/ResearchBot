@@ -1,23 +1,20 @@
 """
 GraphAnalyzer.py — Phase 4.5: Academic Graph Topology Analysis (Full-Corpus).
 
-Reads the compiled graphify-out/graph.json AND the raw Markdown source
-documents from the current pipeline run, then sends both to Gemini 2.5 Pro
-(Vertex AI with STABLE_REGIONS failover — same contract as DataRefiner /
-VertexProxy).
+Reads graphify-out/graph.json and the Markdown corpus from the current pipeline
+run, then runs three concurrent Gemini 2.5 Pro calls (Map-Reduce) — one per gap
+category — each pinned to a different Vertex region with independent failover.
 
-The LLM is asked to reason about the FULL graph topology cross-referenced
-against the source corpus, and to cite the exact source filenames that
-support each insight. This enables the SwiftUI front-end to navigate from
-a research gap straight to the underlying scrape for verification.
+A lightweight fourth call synthesizes the executive summary from merged findings.
+Source corpus files are loaded concurrently via asyncio.to_thread.
 
-Output is a JSON object with three academic gap categories, each entry
-including a `references` array of source filenames, plus an executive
-summary and the list of available source filenames the LLM was given.
+Output matches the Swift `academic_gap_analysis` schema (summary + three
+categories with per-entry `references`, plus `source_files`).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -41,76 +38,120 @@ _STABLE_REGIONS: list[str] = [
     "us-central1",
 ]
 
+# Per-category starting region + failover chain (Map-Reduce load balancer).
+_CATEGORY_REGION_PLANS: dict[str, list[str]] = {
+    "structural_holes": ["europe-west4", "us-central1", "us-east4", "asia-northeast1"],
+    "high_degree_limitations": ["us-east4", "asia-northeast1", "us-central1", "europe-west4"],
+    "orphaned_solutions": ["asia-northeast1", "us-central1", "europe-west4", "us-east4"],
+}
+
+_CATEGORY_LABELS: dict[str, str] = {
+    "structural_holes": "Structural Holes",
+    "high_degree_limitations": "High-Degree Limitations",
+    "orphaned_solutions": "Orphaned Solutions",
+}
+
+_SUMMARY_REGION_PLAN: list[str] = ["global", "us-central1", "europe-west4", "us-east4"]
+
 _ANALYSIS_MODEL = "gemini-2.5-pro"
 
-# Defensive per-file cap to keep individual outlier files from blowing past
-# the 1M-token context window. The LLM still sees every file — only extreme
-# multi-megabyte scrapes get tail-trimmed. No artificial node/edge limits.
 _MAX_CHARS_PER_FILE = 120_000
 
-_TOPOLOGY_PROMPT = """You are an Academic Graph Analyzer helping university students discover Final Year Project (FYP) research gaps.
+_SHARED_CONTEXT = """You are an Academic Graph Analyzer helping university students discover Final Year Project (FYP) research gaps.
 
 You will receive TWO inputs:
 
-  (A) The COMPLETE knowledge-graph topology (every node, every edge, every community) compiled by Graphify from the student's research corpus.
-  (B) The FULL set of source Markdown documents the graph was extracted from. Each document is delimited and labeled with its exact filename.
+  (A) The COMPLETE knowledge-graph topology (every node, every edge, every community).
+  (B) The FULL set of source Markdown documents. Each document is delimited with its exact filename.
 
-Your task is to analyze the topology IN THE CONTEXT OF the source documents — do not treat them as separate. Use the graph to find structural signals, then verify and enrich each signal against the source text. Every claim you make MUST be supported by at least one source document, and you MUST cite the exact filename(s) of that document in the `references` array.
+Cross-reference topology against the source text. Every claim MUST cite exact filename(s) in `references` from the SOURCE DOCUMENTS section only. If a signal cannot be grounded, omit that entry.
 
-Identify FYP opportunities using these three academic indicators:
+Rules for `references`:
+  - Use ONLY filenames from SOURCE DOCUMENTS. Do not invent or rename them.
+  - Include 1-4 strongest supporting filenames per entry.
+"""
 
-1. **Structural Holes** — Disconnected or loosely connected communities in the graph (e.g., a "Societal Problem" cluster and a "New Technology" cluster with few or no bridging edges). For each hole, name the communities involved, explain the disconnect using evidence from the source text, and suggest how a novel FYP could bridge them.
+_PROMPT_STRUCTURAL_HOLES = f"""{_SHARED_CONTEXT}
 
-2. **High-Degree "Limitation" Nodes** — Nodes representing limitations, challenges, weaknesses (e.g., "High Latency", "Privacy Risks", "Scalability Issues") with multiple incoming edges from different source documents. Use the source text to confirm these are multi-source, validated gaps — not single-paper opinions.
+Analyze ONLY for **Structural Holes** — disconnected or loosely connected communities (e.g., societal-problem cluster vs. technology cluster with few bridging edges). For each hole: name communities involved, explain the disconnect using source evidence, and suggest a bridging FYP angle.
 
-3. **Orphaned Solutions** — Existing solutions/methods/approaches in the graph whose outgoing edges point to failure conditions, drawbacks, or "fails when X" situations. Verify in the source text that the failure is real and underexplored, then describe a concrete technical contribution.
+Return ONLY valid JSON (no markdown fences) with this shape:
 
-Return ONLY valid JSON (no markdown fences, no preamble) matching this schema:
-
-{
-  "summary": "3-5 sentence executive summary for the student covering the most actionable FYP angle",
+{{
   "structural_holes": [
-    {
+    {{
       "title": "short title",
       "communities_involved": ["community A", "community B"],
-      "description": "why this is a structural hole, with source-grounded reasoning",
-      "bridging_opportunity": "concrete FYP angle to connect the clusters",
-      "references": ["exact_filename_1.md", "exact_filename_2.md"]
-    }
-  ],
+      "description": "why this is a structural hole, source-grounded",
+      "bridging_opportunity": "concrete FYP angle",
+      "references": ["exact_filename_1.md"]
+    }}
+  ]
+}}
+
+If no defensible structural holes exist, return {{"structural_holes": []}}. Be specific to this graph — no generic advice.
+"""
+
+_PROMPT_HIGH_DEGREE = f"""{_SHARED_CONTEXT}
+
+Analyze ONLY for **High-Degree Limitation Nodes** — limitation/challenge/weakness nodes (e.g., latency, privacy, scalability) with multiple incoming edges from different sources. Confirm in source text that gaps are multi-source validated, not single-paper opinions.
+
+Return ONLY valid JSON (no markdown fences) with this shape:
+
+{{
   "high_degree_limitations": [
-    {
-      "title": "limitation node label or theme",
+    {{
+      "title": "limitation theme",
       "node_labels": ["label1", "label2"],
       "degree": 0,
       "description": "why this is a validated multi-source gap",
-      "evidence": "concrete quote, paraphrase, or pattern observed across the cited sources",
-      "references": ["exact_filename_1.md", "exact_filename_2.md"]
-    }
-  ],
+      "evidence": "quote, paraphrase, or pattern across cited sources",
+      "references": ["exact_filename_1.md"]
+    }}
+  ]
+}}
+
+If none exist, return {{"high_degree_limitations": []}}. Be specific to this graph.
+"""
+
+_PROMPT_ORPHANED = f"""{_SHARED_CONTEXT}
+
+Analyze ONLY for **Orphaned Solutions** — solution/method nodes whose outgoing edges point to failure conditions, drawbacks, or "fails when X". Verify failures in source text; describe a concrete technical FYP contribution.
+
+Return ONLY valid JSON (no markdown fences) with this shape:
+
+{{
   "orphaned_solutions": [
-    {
+    {{
       "title": "solution node label",
-      "failure_conditions": ["condition or drawback 1", "condition 2"],
-      "description": "why this solution is undermined in the literature",
+      "failure_conditions": ["condition 1", "condition 2"],
+      "description": "why the solution is undermined in the literature",
       "technical_contribution": "what an FYP could build or fix",
       "references": ["exact_filename_1.md"]
-    }
+    }}
   ]
-}
+}}
 
-Rules for `references`:
-  - Use ONLY filenames that appear in the SOURCE DOCUMENTS section below. Do not invent or rename them.
-  - Include 1-4 of the strongest supporting filenames per entry.
-  - If a claim cannot be grounded in any provided source, omit that entry entirely.
+If none exist, return {{"orphaned_solutions": []}}. Be specific to this graph.
+"""
 
-If a category has no defensible signal in this run, return an empty array for that key. Be specific to the actual graph nodes and source content — do not produce generic FYP advice.
+_SUMMARY_PROMPT = """You are summarizing academic graph gap analysis for a university FYP student.
+
+You will receive a digest of structural holes, high-degree limitations, and orphaned solutions already extracted from their research graph.
+
+Write a 2-4 sentence executive summary covering the single most actionable FYP angle. Be concrete; do not repeat every item.
+
+Return ONLY valid JSON: {"summary": "your 2-4 sentences here"}
 """
 
 _SYSTEM_INSTRUCTION = (
     "You analyze knowledge-graph topology against source documents for university "
     "Final Year Project gap hunting. Every insight must cite real source filenames. "
     "Respond with strict JSON only."
+)
+
+_SYSTEM_INSTRUCTION_SUMMARY = (
+    "You write concise executive summaries for FYP gap analysis. Respond with strict JSON only."
 )
 
 
@@ -160,10 +201,7 @@ def _node_index(graph_data: dict) -> dict[str, dict]:
 
 
 def _build_topology_summary(graph_data: dict) -> str:
-    """
-    Emit the COMPLETE topology — every node, every community, every edge.
-    No truncation; the LLM sees the full graph.
-    """
+    """Emit the complete topology — every node, community, and edge."""
     nodes = graph_data.get("nodes", [])
     links = graph_data.get("links", [])
     degrees = _compute_degrees(graph_data)
@@ -240,51 +278,77 @@ def _build_topology_summary(graph_data: dict) -> str:
     return "\n".join(parts)
 
 
-def _load_source_corpus(current_run_files: Iterable[Path]) -> tuple[str, list[str]]:
-    """
-    Read every Markdown file in *current_run_files* and emit a single
-    LLM-friendly block with explicit filename delimiters.
+def _topology_stats_line(graph_data: dict) -> str:
+    return (
+        f"{len(graph_data.get('nodes', []))} nodes, "
+        f"{len(graph_data.get('links', []))} edges"
+    )
 
-    Returns (corpus_text, list_of_filenames). Missing or unreadable files
-    are silently skipped and excluded from the filename list.
+
+def _read_single_markdown(raw_path: Path) -> tuple[str, str] | None:
+    """Sync helper: read one .md file; returns (filename, block) or None."""
+    if not raw_path.is_file() or raw_path.suffix.lower() != ".md":
+        return None
+    try:
+        text = raw_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception as e:
+        logger.warning("GraphAnalyzer: failed to read %s — %s", raw_path, e)
+        return None
+    if not text.strip():
+        return None
+    if len(text) > _MAX_CHARS_PER_FILE:
+        text = text[:_MAX_CHARS_PER_FILE] + "\n\n[... truncated for context window ...]"
+    block = f"<<<FILE: {raw_path.name}>>>\n{text}\n<<<END FILE: {raw_path.name}>>>"
+    return raw_path.name, block
+
+
+async def _load_source_corpus_async(
+    current_run_files: Iterable[Path],
+) -> tuple[str, list[str]]:
     """
-    blocks: list[str] = []
-    filenames: list[str] = []
+    Concurrently read every Markdown file and build the SOURCE DOCUMENTS block.
+    """
+    paths: list[Path] = []
     seen: set[str] = set()
-
     for raw_path in current_run_files or []:
         try:
             p = Path(raw_path)
         except Exception:
             continue
-        if not p.is_file():
-            continue
-        if p.suffix.lower() != ".md":
-            continue
         if p.name in seen:
             continue
-
-        try:
-            text = p.read_text(encoding="utf-8", errors="ignore")
-        except Exception as e:
-            logger.warning("GraphAnalyzer: failed to read %s — %s", p, e)
+        if not p.is_file() or p.suffix.lower() != ".md":
             continue
-
-        if not text.strip():
-            continue
-
-        if len(text) > _MAX_CHARS_PER_FILE:
-            text = text[:_MAX_CHARS_PER_FILE] + "\n\n[... truncated for context window ...]"
-
         seen.add(p.name)
-        filenames.append(p.name)
-        blocks.append(
-            f"<<<FILE: {p.name}>>>\n{text}\n<<<END FILE: {p.name}>>>"
-        )
+        paths.append(p)
+
+    if not paths:
+        return "(no source documents available for this run)", []
+
+    results = await asyncio.gather(
+        *[asyncio.to_thread(_read_single_markdown, p) for p in paths],
+        return_exceptions=True,
+    )
+
+    blocks: list[str] = []
+    filenames: list[str] = []
+    for item in results:
+        if isinstance(item, Exception):
+            logger.warning("GraphAnalyzer: corpus read error — %s", item)
+            continue
+        if item is None:
+            continue
+        name, block = item
+        filenames.append(name)
+        blocks.append(block)
 
     if not blocks:
         return "(no source documents available for this run)", []
 
+    print(
+        f"PROGRESS: Phase 4.5 — loaded {len(filenames)} source files (async I/O).",
+        flush=True,
+    )
     return "\n\n".join(blocks), filenames
 
 
@@ -315,7 +379,6 @@ def _sanitize_references(
     refs: Any,
     allowed_filenames: set[str],
 ) -> list[str]:
-    """Keep only references that point to a real filename we provided."""
     if not isinstance(refs, list):
         return []
     cleaned: list[str] = []
@@ -328,79 +391,327 @@ def _sanitize_references(
     return cleaned
 
 
-def _normalize_analysis(
-    parsed: dict[str, Any],
+def _scrub_category_list(
+    items: Any,
     allowed_filenames: set[str],
-) -> dict[str, Any]:
-    """Ensure required keys exist, list types, and references are validated."""
-    def _scrub_list(items: Any) -> list[dict[str, Any]]:
-        if not isinstance(items, list):
-            return []
-        cleaned: list[dict[str, Any]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            item["references"] = _sanitize_references(
-                item.get("references"), allowed_filenames
-            )
-            cleaned.append(item)
-        return cleaned
-
-    return {
-        "summary": str(parsed.get("summary") or "").strip()
-        or "Topology analyzed; see category lists below.",
-        "structural_holes": _scrub_list(parsed.get("structural_holes")),
-        "high_degree_limitations": _scrub_list(parsed.get("high_degree_limitations")),
-        "orphaned_solutions": _scrub_list(parsed.get("orphaned_solutions")),
-        "source_files": sorted(allowed_filenames),
-    }
+) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    cleaned: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item = dict(item)
+        item["references"] = _sanitize_references(
+            item.get("references"), allowed_filenames
+        )
+        cleaned.append(item)
+    return cleaned
 
 
-def _call_gemini_with_failover(
+def _build_llm_contents(prompt: str, topology_block: str, source_block: str) -> list[str]:
+    return [
+        f"{prompt}\n\n"
+        f"--- GRAPH TOPOLOGY ---\n{topology_block}\n\n"
+        f"--- SOURCE DOCUMENTS ---\n{source_block}"
+    ]
+
+
+async def _analyze_category_async(
+    category_key: str,
+    prompt: str,
     topology_block: str,
     source_block: str,
     allowed_filenames: set[str],
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
+    """
+    Run a single category analysis with regional sharding and per-task failover.
+    """
+    label = _CATEGORY_LABELS[category_key]
+    regions = _CATEGORY_REGION_PLANS[category_key]
     config = types.GenerateContentConfig(
         max_output_tokens=16384,
         system_instruction=_SYSTEM_INSTRUCTION,
         response_mime_type="application/json",
     )
-    contents = [
-        f"{_TOPOLOGY_PROMPT}\n\n"
-        f"--- GRAPH TOPOLOGY ---\n{topology_block}\n\n"
-        f"--- SOURCE DOCUMENTS ---\n{source_block}"
-    ]
-
+    contents = _build_llm_contents(prompt, topology_block, source_block)
     last_exc: Exception | None = None
 
-    try:
-        client = _make_client("global")
-        response = _call_gemini(client, contents, config)
-        if response.text:
-            return _normalize_analysis(
-                _parse_json_response(response.text), allowed_filenames
-            )
-    except Exception as primary_exc:
-        logger.warning("GraphAnalyzer: global endpoint failed (%s)", primary_exc)
-        last_exc = primary_exc
-
-    for region in _STABLE_REGIONS:
+    for region in regions:
+        print(
+            f"PROGRESS: Phase 4.5 — routing {label} to {region}...",
+            flush=True,
+        )
         try:
-            print(f"PROGRESS: Phase 4.5 — regional failover → {region}", flush=True)
-            client = _make_client(region)
-            response = _call_gemini(client, contents, config)
-            if response.text:
-                logger.info("GraphAnalyzer: regional failover SUCCESS → %s", region)
-                return _normalize_analysis(
-                    _parse_json_response(response.text), allowed_filenames
+            client = await asyncio.to_thread(_make_client, region)
+            response = await asyncio.to_thread(_call_gemini, client, contents, config)
+            if not response.text:
+                raise RuntimeError(f"Empty response for {category_key} in {region}")
+            parsed = _parse_json_response(response.text)
+            items = _scrub_category_list(parsed.get(category_key), allowed_filenames)
+            print(
+                f"PROGRESS: Phase 4.5 — ✓ {label} complete via {region} "
+                f"({len(items)} entries).",
+                flush=True,
+            )
+            return items
+        except Exception as exc:
+            last_exc = exc
+            if _is_resource_exhausted(exc):
+                logger.warning(
+                    "GraphAnalyzer: %s 429/resource exhausted at %s — failover",
+                    category_key,
+                    region,
                 )
-        except Exception as region_exc:
-            logger.warning("GraphAnalyzer: region %s failed: %s", region, region_exc)
-            last_exc = region_exc
+                print(
+                    f"PROGRESS: Phase 4.5 — {label} quota hit at {region}, "
+                    f"retrying next region...",
+                    flush=True,
+                )
+            else:
+                logger.warning(
+                    "GraphAnalyzer: %s failed at %s: %s",
+                    category_key,
+                    region,
+                    exc,
+                )
+                print(
+                    f"PROGRESS: Phase 4.5 — {label} error at {region}: {exc}",
+                    flush=True,
+                )
 
     raise RuntimeError(
-        f"Graph topology analysis failed after exhausting all regions. Last error: {last_exc}"
+        f"{label} analysis failed after exhausting regions "
+        f"({', '.join(regions)}). Last error: {last_exc}"
+    )
+
+
+def _build_findings_digest(
+    structural_holes: list[dict[str, Any]],
+    high_degree_limitations: list[dict[str, Any]],
+    orphaned_solutions: list[dict[str, Any]],
+) -> str:
+    digest = {
+        "structural_holes": [
+            {
+                "title": h.get("title"),
+                "communities_involved": h.get("communities_involved"),
+                "bridging_opportunity": h.get("bridging_opportunity"),
+            }
+            for h in structural_holes[:6]
+        ],
+        "high_degree_limitations": [
+            {
+                "title": h.get("title"),
+                "node_labels": h.get("node_labels"),
+                "degree": h.get("degree"),
+            }
+            for h in high_degree_limitations[:6]
+        ],
+        "orphaned_solutions": [
+            {
+                "title": s.get("title"),
+                "failure_conditions": s.get("failure_conditions"),
+                "technical_contribution": s.get("technical_contribution"),
+            }
+            for s in orphaned_solutions[:6]
+        ],
+    }
+    return json.dumps(digest, ensure_ascii=False, indent=2)
+
+
+async def _generate_executive_summary_async(
+    structural_holes: list[dict[str, Any]],
+    high_degree_limitations: list[dict[str, Any]],
+    orphaned_solutions: list[dict[str, Any]],
+    topology_stats: str,
+) -> str:
+    """Lightweight fourth call — small payload, fast summary synthesis."""
+    digest = _build_findings_digest(
+        structural_holes, high_degree_limitations, orphaned_solutions
+    )
+    contents = [
+        f"{_SUMMARY_PROMPT}\n\n"
+        f"--- FINDINGS DIGEST ---\n{digest}\n\n"
+        f"--- TOPOLOGY STATS ---\n{topology_stats}"
+    ]
+    config = types.GenerateContentConfig(
+        max_output_tokens=2048,
+        system_instruction=_SYSTEM_INSTRUCTION_SUMMARY,
+        response_mime_type="application/json",
+    )
+    last_exc: Exception | None = None
+
+    for region in _SUMMARY_REGION_PLAN:
+        print(
+            f"PROGRESS: Phase 4.5 — routing Executive Summary to {region}...",
+            flush=True,
+        )
+        try:
+            client = await asyncio.to_thread(_make_client, region)
+            response = await asyncio.to_thread(_call_gemini, client, contents, config)
+            if not response.text:
+                raise RuntimeError(f"Empty summary response in {region}")
+            parsed = _parse_json_response(response.text)
+            summary = str(parsed.get("summary") or "").strip()
+            if summary:
+                print(
+                    f"PROGRESS: Phase 4.5 — ✓ Executive Summary via {region}.",
+                    flush=True,
+                )
+                return summary
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("GraphAnalyzer: summary failed at %s: %s", region, exc)
+            if _is_resource_exhausted(exc):
+                print(
+                    f"PROGRESS: Phase 4.5 — Executive Summary quota hit at {region}, "
+                    f"retrying...",
+                    flush=True,
+                )
+
+    logger.warning(
+        "GraphAnalyzer: executive summary fallback after regions exhausted: %s",
+        last_exc,
+    )
+    return _fallback_summary_from_findings(
+        structural_holes, high_degree_limitations, orphaned_solutions
+    )
+
+
+def _fallback_summary_from_findings(
+    structural_holes: list[dict[str, Any]],
+    high_degree_limitations: list[dict[str, Any]],
+    orphaned_solutions: list[dict[str, Any]],
+) -> str:
+    parts: list[str] = []
+    if structural_holes:
+        parts.append(
+            f"Structural bridging opportunity: {structural_holes[0].get('title', 'see holes')}."
+        )
+    if high_degree_limitations:
+        parts.append(
+            f"Validated multi-source gap: {high_degree_limitations[0].get('title', 'see limitations')}."
+        )
+    if orphaned_solutions:
+        parts.append(
+            f"Orphaned solution angle: {orphaned_solutions[0].get('title', 'see solutions')}."
+        )
+    if parts:
+        return " ".join(parts)
+    return "Topology analyzed; see category lists below for FYP opportunities."
+
+
+def _merge_analysis_results(
+    structural_holes: list[dict[str, Any]],
+    high_degree_limitations: list[dict[str, Any]],
+    orphaned_solutions: list[dict[str, Any]],
+    summary: str,
+    allowed_filenames: set[str],
+    partial_errors: list[str] | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "summary": summary.strip() or "Topology analyzed; see category lists below.",
+        "structural_holes": structural_holes,
+        "high_degree_limitations": high_degree_limitations,
+        "orphaned_solutions": orphaned_solutions,
+        "source_files": sorted(allowed_filenames),
+    }
+    if partial_errors:
+        out["error"] = "; ".join(partial_errors)
+    return out
+
+
+async def _run_map_reduce_analysis_async(
+    graph_data: dict,
+    current_run_files: Iterable[Path],
+) -> dict[str, Any]:
+    """Concurrent Map-Reduce over three gap categories + executive summary."""
+    print(
+        "PROGRESS: Phase 4.5 — Map-Reduce: 3 parallel category analyses "
+        "+ executive summary...",
+        flush=True,
+    )
+    topology_block = _build_topology_summary(graph_data)
+    source_block, filenames = await _load_source_corpus_async(current_run_files)
+    allowed = set(filenames)
+
+    print(
+        f"PROGRESS: Phase 4.5 — corpus: {len(filenames)} source files, "
+        f"{len(graph_data.get('nodes', []))} nodes, "
+        f"{len(graph_data.get('links', []))} edges.",
+        flush=True,
+    )
+
+    map_tasks = [
+        _analyze_category_async(
+            "structural_holes",
+            _PROMPT_STRUCTURAL_HOLES,
+            topology_block,
+            source_block,
+            allowed,
+        ),
+        _analyze_category_async(
+            "high_degree_limitations",
+            _PROMPT_HIGH_DEGREE,
+            topology_block,
+            source_block,
+            allowed,
+        ),
+        _analyze_category_async(
+            "orphaned_solutions",
+            _PROMPT_ORPHANED,
+            topology_block,
+            source_block,
+            allowed,
+        ),
+    ]
+
+    raw_results = await asyncio.gather(*map_tasks, return_exceptions=True)
+
+    partial_errors: list[str] = []
+    structural_holes: list[dict[str, Any]] = []
+    high_degree_limitations: list[dict[str, Any]] = []
+    orphaned_solutions: list[dict[str, Any]] = []
+
+    for key, result in zip(
+        ("structural_holes", "high_degree_limitations", "orphaned_solutions"),
+        raw_results,
+    ):
+        label = _CATEGORY_LABELS[key]
+        if isinstance(result, Exception):
+            msg = f"{label}: {result}"
+            partial_errors.append(msg)
+            logger.error("GraphAnalyzer Map task failed: %s", msg)
+            print(f"PROGRESS: Phase 4.5 — ✗ {msg}", flush=True)
+            continue
+        if key == "structural_holes":
+            structural_holes = result
+        elif key == "high_degree_limitations":
+            high_degree_limitations = result
+        else:
+            orphaned_solutions = result
+
+    if not any([structural_holes, high_degree_limitations, orphaned_solutions]):
+        raise RuntimeError(
+            "All three category analyses failed. "
+            + (partial_errors[0] if partial_errors else "unknown")
+        )
+
+    summary = await _generate_executive_summary_async(
+        structural_holes,
+        high_degree_limitations,
+        orphaned_solutions,
+        _topology_stats_line(graph_data),
+    )
+
+    return _merge_analysis_results(
+        structural_holes,
+        high_degree_limitations,
+        orphaned_solutions,
+        summary,
+        allowed,
+        partial_errors if partial_errors else None,
     )
 
 
@@ -409,24 +720,9 @@ def analyze_graph_topology(
     graph_json_path: Path | None = None,
 ) -> dict[str, Any]:
     """
-    Phase 4.5 entry point.
+    Phase 4.5 entry point (sync wrapper around asyncio Map-Reduce).
 
-    Parameters
-    ----------
-    current_run_files : iterable of Path
-        The exact set of Markdown files compiled in this pipeline run.
-        Their text content is appended to the LLM prompt under
-        `--- SOURCE DOCUMENTS ---` so the model can cross-reference
-        topology against original source text and cite filenames.
-    graph_json_path : Path, optional
-        Override for graphify-out/graph.json. Defaults to the canonical KB
-        location.
-
-    Returns
-    -------
-    dict
-        academic_gap_analysis payload (summary + three categories with
-        per-entry `references`, plus `source_files` and optional `error`).
+    Returns academic_gap_analysis payload for Swift bridging.
     """
     path = graph_json_path or (get_kb_root() / "graphify-out" / "graph.json")
 
@@ -444,23 +740,21 @@ def analyze_graph_topology(
     if not graph_data.get("nodes"):
         return _empty_analysis("graph.json contains no nodes.")
 
-    print("PROGRESS: Phase 4.5 — analyzing graph topology + source corpus...", flush=True)
-    topology_block = _build_topology_summary(graph_data)
-    source_block, filenames = _load_source_corpus(current_run_files or [])
-    allowed = set(filenames)
-
     print(
-        f"PROGRESS: Phase 4.5 — corpus: {len(filenames)} source files, "
-        f"{len(graph_data.get('nodes', []))} nodes, "
-        f"{len(graph_data.get('links', []))} edges.",
+        "PROGRESS: Phase 4.5 — analyzing graph topology + source corpus (Map-Reduce)...",
         flush=True,
     )
 
     try:
-        result = _call_gemini_with_failover(topology_block, source_block, allowed)
+        result = asyncio.run(
+            _run_map_reduce_analysis_async(graph_data, current_run_files or [])
+        )
         print("PROGRESS: Phase 4.5 — ✓ academic gap analysis complete.", flush=True)
         return result
     except Exception as e:
         logger.error("GraphAnalyzer failed: %s", e)
         print(f"PROGRESS: Phase 4.5 — ✗ analysis error: {e}", flush=True)
+        _, filenames = asyncio.run(
+            _load_source_corpus_async(current_run_files or [])
+        )
         return _empty_analysis(str(e), source_files=filenames)
