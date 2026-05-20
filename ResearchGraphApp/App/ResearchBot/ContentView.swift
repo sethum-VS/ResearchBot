@@ -23,6 +23,8 @@ struct ContentView: View {
             if showGraph, let graphPath = bridge.graphFilePath {
                 GraphView(
                     graphPath: graphPath,
+                    gapAnalysis: bridge.academicGapAnalysis,
+                    kbRoot: bridge.kbRoot,
                     onBack: { showGraph = false }
                 )
             } else {
@@ -177,11 +179,30 @@ struct InputView: View {
 
 struct GraphView: View {
     let graphPath: String
+    let gapAnalysis: AcademicGapAnalysis?
+    let kbRoot: String?
     var onBack: () -> Void
+
+    @State private var panelCollapsed = false
+    @State private var showFullAnalysis = false
+
+    private var placeholderAnalysis: AcademicGapAnalysis {
+        AcademicGapAnalysis(
+            summary: "Gap analysis will appear here after the pipeline completes Phase 4.5.",
+            structuralHoles: [],
+            highDegreeLimitations: [],
+            orphanedSolutions: [],
+            sourceFiles: [],
+            error: nil
+        )
+    }
+
+    private var resolvedAnalysis: AcademicGapAnalysis {
+        gapAnalysis ?? placeholderAnalysis
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            // Toolbar
             HStack {
                 Button {
                     onBack()
@@ -198,7 +219,6 @@ struct GraphView: View {
 
                 Spacer()
 
-                // Balance the back button width
                 Color.clear.frame(width: 100)
             }
             .padding(.horizontal, 16)
@@ -208,10 +228,25 @@ struct GraphView: View {
 
             Divider()
 
-            // WebView
-            GraphWebView(filePath: graphPath)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .layoutPriority(1)
+            HSplitView {
+                GraphWebView(filePath: graphPath)
+                    .frame(minWidth: 400)
+                    .layoutPriority(1)
+
+                GapAnalysisPanel(
+                    analysis: resolvedAnalysis,
+                    isCollapsed: $panelCollapsed,
+                    onOpenFullAnalysis: { showFullAnalysis = true }
+                )
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .sheet(isPresented: $showFullAnalysis) {
+            FullDetailWindow(
+                analysis: resolvedAnalysis,
+                kbRoot: kbRoot,
+                onClose: { showFullAnalysis = false }
+            )
         }
     }
 }

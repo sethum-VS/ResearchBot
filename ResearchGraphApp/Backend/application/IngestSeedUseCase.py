@@ -47,6 +47,7 @@ from infrastructure.WikiAPI import get_wiki_summary
 from infrastructure.AcademicScraper import search_academic_papers
 from infrastructure.FileStorage import save_markdown, ensure_structure, get_kb_root
 from infrastructure.GraphifyRunner import run_graphify, GraphifyError
+from application.GraphAnalyzer import analyze_graph_topology
 
 logger = logging.getLogger(__name__)
 
@@ -478,11 +479,31 @@ def execute(idea: str, url: str) -> dict:
     else:
         print("PROGRESS: Phase 4 — ✓ knowledge graph generated.", flush=True)
 
-    # Swift bridging contract — JSON stdout schema must remain unchanged.
+    # ── Phase 4.5: Academic Graph Topology Analysis ────────────────────
+    # Pass the full current_run_files corpus so the analyzer can ground
+    # every gap claim in actual source filenames.
+    if graphify_error is None:
+        academic_gap_analysis = analyze_graph_topology(
+            current_run_files=current_run_files,
+        )
+    else:
+        academic_gap_analysis = {
+            "summary": "Academic gap analysis requires a successful knowledge graph.",
+            "structural_holes": [],
+            "high_degree_limitations": [],
+            "orphaned_solutions": [],
+            "source_files": [],
+            "error": graphify_error,
+        }
+
+    # Swift bridging contract — extends payload with academic_gap_analysis
+    # and kb_root so the SwiftUI MarkdownViewer can resolve reference
+    # filenames to absolute paths on disk.
     return {
         "status": "success",
         "message": "Research pipeline completed successfully.",
         "graph_path": str(graph_path_abs.resolve()),
+        "kb_root": str(get_kb_root().resolve()),
         "phase": "Phase 4 — Knowledge Graph Generation Complete",
         "seed_analysis": {
             "core_context": core_context,
@@ -497,4 +518,5 @@ def execute(idea: str, url: str) -> dict:
             "stdout": graphify_output[:1000] if graphify_output else "",
             "error": graphify_error,
         },
+        "academic_gap_analysis": academic_gap_analysis,
     }

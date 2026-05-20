@@ -16,13 +16,17 @@ struct PipelineResult: Codable {
     let status: String
     let message: String
     let graphPath: String?
+    let kbRoot: String?
     let phase: String?
     let synthesisPreview: String?
+    let academicGapAnalysis: AcademicGapAnalysis?
 
     enum CodingKeys: String, CodingKey {
         case status, message, phase
         case graphPath = "graph_path"
+        case kbRoot = "kb_root"
         case synthesisPreview = "synthesis_preview"
+        case academicGapAnalysis = "academic_gap_analysis"
     }
 }
 
@@ -36,7 +40,9 @@ final class PythonBridge {
     var progress: String = ""
     var errorMessage: String?
     var graphFilePath: String?
+    var kbRoot: String?
     var synthesisPreview: String?
+    var academicGapAnalysis: AcademicGapAnalysis?
 
     // MARK: - Script Resolution
 
@@ -71,7 +77,9 @@ final class PythonBridge {
         progress = "Initializing pipeline…\n"
         errorMessage = nil
         graphFilePath = nil
+        kbRoot = nil
         synthesisPreview = nil
+        academicGapAnalysis = nil
 
         Task.detached(priority: .userInitiated) { [weak self] in
             await self?.executeProcess(script: script, idea: idea)
@@ -152,7 +160,9 @@ final class PythonBridge {
                 errorMessage = result.message
             } else {
                 graphFilePath = result.graphPath
+                kbRoot = result.kbRoot
                 synthesisPreview = result.synthesisPreview
+                academicGapAnalysis = result.academicGapAnalysis
                 errorMessage = nil
             }
         } catch {
