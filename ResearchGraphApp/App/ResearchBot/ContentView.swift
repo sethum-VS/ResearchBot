@@ -16,6 +16,7 @@ import WebKit
 struct ContentView: View {
     @State private var bridge = PythonBridge()
     @State private var idea: String = ""
+    @State private var referenceURL: String = ""
     @State private var showGraph = false
 
     var body: some View {
@@ -30,6 +31,7 @@ struct ContentView: View {
             } else {
                 InputView(
                     idea: $idea,
+                    referenceURL: $referenceURL,
                     bridge: bridge,
                     onGraphReady: { showGraph = true }
                 )
@@ -43,6 +45,7 @@ struct ContentView: View {
 
 struct InputView: View {
     @Binding var idea: String
+    @Binding var referenceURL: String
     @Bindable var bridge: PythonBridge
     var onGraphReady: () -> Void
 
@@ -73,14 +76,17 @@ struct InputView: View {
                                 .strokeBorder(.quaternary, lineWidth: 1)
                         )
 
-                    Text("Paste a topic, question, or URL. The AI automatically extracts keywords and intent.")
+                    TextField("Optional reference URL (https://…)", text: $referenceURL)
+                        .textFieldStyle(.roundedBorder)
+
+                    Text("Paste a topic or question. Add an optional URL for Firecrawl and seed analysis.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
                 // Run button
                 Button {
-                    bridge.runPipeline(idea: idea)
+                    bridge.runPipeline(idea: idea, url: referenceURL)
                 } label: {
                     HStack(spacing: 8) {
                         if bridge.isRunning {

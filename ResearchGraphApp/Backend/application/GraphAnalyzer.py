@@ -56,6 +56,8 @@ _SUMMARY_REGION_PLAN: list[str] = ["global", "us-central1", "europe-west4", "us-
 _ANALYSIS_MODEL = "gemini-2.5-pro"
 
 _MAX_CHARS_PER_FILE = 120_000
+# Keep map prompts under Gemini's per-request limit (topology + corpus).
+_MAX_TOTAL_CORPUS_CHARS = 240_000
 
 _SHARED_CONTEXT = """You are an Academic Graph Analyzer helping university students discover Final Year Project (FYP) research gaps.
 
@@ -297,9 +299,69 @@ def _read_single_markdown(raw_path: Path) -> tuple[str, str] | None:
     if not text.strip():
         return None
     if len(text) > _MAX_CHARS_PER_FILE:
-        text = text[:_MAX_CHARS_PER_FILE] + "\n\n[... truncated for context window ...]"
+        # Tail-trim: keep the end of long docs (limitations, URLs, conclusions).
+        text = (
+            "[... leading content truncated for context window ...]\n\n"
+            + text[-_MAX_CHARS_PER_FILE:]
+        )
     block = f"<<<FILE: {raw_path.name}>>>\n{text}\n<<<END FILE: {raw_path.name}>>>"
     return raw_path.name, block
+
+
+def _corpus_priority(path: Path) -> int:
+    """Lower = included first when corpus budget is tight."""
+    parent = path.parent.name
+    name = path.name.lower()
+    if parent == "processed_summaries":
+        return 0
+    if "_urlrefiner" in name:
+        return 1
+    if parent == "agent_scrapes":
+        return 2
+    if parent == "raw_ingestion":
+        return 3
+    return 4
+
+
+def _apply_total_corpus_budget(
+    entries: list[tuple[Path, str, str]],
+) -> tuple[str, list[str], int]:
+    """
+    Concatenate file blocks in priority order without exceeding
+    _MAX_TOTAL_CORPUS_CHARS (map prompts must fit model input limits).
+    """
+    ordered = sorted(entries, key=lambda e: _corpus_priority(e[0]))
+    blocks: list[str] = []
+    filenames: list[str] = []
+    total = 0
+    omitted = 0
+
+    for _path, name, block in ordered:
+        if total + len(block) <= _MAX_TOTAL_CORPUS_CHARS:
+            blocks.append(block)
+            filenames.append(name)
+            total += len(block)
+            continue
+
+        remaining = _MAX_TOTAL_CORPUS_CHARS - total
+        if remaining > 2000:
+            trimmed = (
+                block[:remaining]
+                + f"\n\n[... FILE {name} truncated to fit corpus budget ...]"
+            )
+            blocks.append(trimmed)
+            filenames.append(name)
+            total += len(trimmed)
+        omitted += 1
+
+    if omitted:
+        print(
+            f"PROGRESS: Phase 4.5 — corpus budget: included {len(filenames)} files "
+            f"({total:,} chars), omitted {omitted} lower-priority file(s).",
+            flush=True,
+        )
+
+    return "\n\n".join(blocks), filenames, omitted
 
 
 async def _load_source_corpus_async(
@@ -307,19 +369,20 @@ async def _load_source_corpus_async(
 ) -> tuple[str, list[str]]:
     """
     Concurrently read every Markdown file and build the SOURCE DOCUMENTS block.
+    Uses resolved paths (not basenames) so duplicate filenames are not dropped.
     """
     paths: list[Path] = []
-    seen: set[str] = set()
+    seen: set[Path] = set()
     for raw_path in current_run_files or []:
         try:
-            p = Path(raw_path)
+            p = Path(raw_path).resolve()
         except Exception:
             continue
-        if p.name in seen:
+        if p in seen:
             continue
         if not p.is_file() or p.suffix.lower() != ".md":
             continue
-        seen.add(p.name)
+        seen.add(p)
         paths.append(p)
 
     if not paths:
@@ -330,26 +393,27 @@ async def _load_source_corpus_async(
         return_exceptions=True,
     )
 
-    blocks: list[str] = []
-    filenames: list[str] = []
-    for item in results:
+    entries: list[tuple[Path, str, str]] = []
+    for path, item in zip(paths, results):
         if isinstance(item, Exception):
             logger.warning("GraphAnalyzer: corpus read error — %s", item)
             continue
         if item is None:
             continue
         name, block = item
-        filenames.append(name)
-        blocks.append(block)
+        entries.append((path, name, block))
 
-    if not blocks:
+    if not entries:
         return "(no source documents available for this run)", []
 
+    corpus, filenames, _ = _apply_total_corpus_budget(entries)
+
     print(
-        f"PROGRESS: Phase 4.5 — loaded {len(filenames)} source files (async I/O).",
+        f"PROGRESS: Phase 4.5 — loaded {len(filenames)} source files "
+        f"({len(corpus):,} chars, async I/O).",
         flush=True,
     )
-    return "\n\n".join(blocks), filenames
+    return corpus, filenames
 
 
 def _parse_json_response(raw_text: str) -> dict[str, Any]:
@@ -692,7 +756,8 @@ async def _run_map_reduce_analysis_async(
         else:
             orphaned_solutions = result
 
-    if not any([structural_holes, high_degree_limitations, orphaned_solutions]):
+    # Only fail the reduce step when every map task raised (not when models return []).
+    if len(partial_errors) >= 3:
         raise RuntimeError(
             "All three category analyses failed. "
             + (partial_errors[0] if partial_errors else "unknown")

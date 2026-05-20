@@ -10,6 +10,7 @@ graph.html (resizable sidebar) and replaces integer community IDs with
 short, AI-generated descriptive titles via Gemini 2.5 Flash.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -22,7 +23,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 from infrastructure.FileStorage import get_kb_root
 
-load_dotenv()
+_BACKEND_DIR = Path(__file__).resolve().parent.parent
+_ENV_PATH = _BACKEND_DIR.parent.parent / ".env"
+load_dotenv(_ENV_PATH)
 
 logger = logging.getLogger(__name__)
 
@@ -201,14 +204,11 @@ def _generate_community_names(
 
 
 def _patch_graph_json(graph_data: dict, name_map: dict[int, str]) -> dict:
-    """
-    Replace the integer ``community`` property on every node with the
-    smart string title from *name_map*.
-    """
+    """Add ``community_name`` labels while preserving integer ``community`` ids."""
     for node in graph_data.get("nodes", []):
         old_cid = node.get("community")
         if old_cid is not None and old_cid in name_map:
-            node["community"] = name_map[old_cid]
+            node["community_name"] = name_map[old_cid]
     return graph_data
 
 
@@ -363,7 +363,11 @@ def _prepare_filtered_kb(kb_path: Path, current_run_files: list[Path]) -> Path:
 
         if include:
             try:
-                shutil.copy2(f, temp_dir / f.name)
+                # Unique dest names — many runs use the same topic slug + timestamp
+                # patterns; copying by basename alone silently overwrites inputs.
+                digest = hashlib.sha256(str(f.resolve()).encode()).hexdigest()[:10]
+                dest = temp_dir / f"{digest}_{f.name}"
+                shutil.copy2(f, dest)
             except OSError as e:
                 logger.warning("Could not copy %s: %s", f, e)
 

@@ -1,5 +1,6 @@
 # Sprint 2 — Phase 2 Context Expansion & Scraping
 google-genai
+pydantic>=2.0
 tavily-python
 requests
 python-dotenv

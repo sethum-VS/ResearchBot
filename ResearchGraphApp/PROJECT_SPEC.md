@@ -28,7 +28,7 @@ Simply rendering a knowledge graph is not sufficient. Phase **4.5 (Academic Grap
 | Model | Role |
 |-------|------|
 | **Gemini 2.5 Flash** | Phase 1.5 input analysis; Phase 2.6 high-value URL extraction |
-| **Gemini 2.5 Pro** | Phase 2.5 noise refinement; Phase 3 synthesis; **Phase 4.5 full-corpus gap analysis** |
+| **Gemini 2.5 Pro** | Phase 2.5 noise refinement; Phase 3 synthesis; **Phase 4.5 Map-Reduce gap analysis** (3 parallel category calls + executive summary) |
 | **Llama 4 Scout** | Phase 4 knowledge-graph extraction (10M context via VertexProxy) |
 
 ### Data Ingestion APIs
@@ -67,8 +67,8 @@ graph TD
     M -->|token-budget 1500| N[Llama 4 Scout via VertexProxy :8000]
     N --> O[graphify-out: graph.json / graph.html]
 
-    B -->|Phase 4.5| P[GraphAnalyzer.py]
-    P -->|graph.json + current_run_files corpus| Q[Gemini 2.5 Pro]
+    B -->|Phase 4.5 Map-Reduce| P[GraphAnalyzer.py]
+    P -->|3 parallel + summary| Q[Gemini 2.5 Pro × regions]
     Q --> R[academic_gap_analysis JSON]
 
     O --> S[GraphView: WKWebView]
@@ -174,30 +174,64 @@ SwiftUI (PythonBridge)
 }
 ```
 
-### Phase 4.5: Academic Graph Topology Analysis (Full-Corpus)
+### Phase 4.5: Academic Graph Topology Analysis (Map-Reduce, Full-Corpus)
+
+Phase 4.5 avoids a single monolithic Gemini call over the full graph + corpus (high latency and regional burst quotas). Instead it uses **async Map-Reduce**: three specialized category analyses run in parallel, then a lightweight fourth call merges an executive summary.
 
 | Item | Detail |
 |------|--------|
 | **Module** | `GraphAnalyzer.analyze_graph_topology(current_run_files, graph_json_path=None)` |
+| **Entry** | Sync wrapper; inner orchestration via `asyncio.run(_run_map_reduce_analysis_async(...))` |
 | **Trigger** | `IngestSeedUseCase` after successful Phase 4 only |
-| **Model** | Gemini 2.5 Pro (`response_mime_type=application/json`, `max_output_tokens=16384`) |
+| **Model** | Gemini 2.5 Pro (`response_mime_type=application/json`) |
 | **Inputs** | (A) Complete `graph.json` topology — **all nodes, all edges, all communities** (no artificial truncation). (B) Full Markdown corpus from `current_run_files` under `--- SOURCE DOCUMENTS ---` |
+| **Corpus I/O** | `_load_source_corpus_async()` — concurrent per-file reads via `asyncio.gather` + `asyncio.to_thread` |
 | **Per-file safety** | `_MAX_CHARS_PER_FILE = 120_000` tail-trim only for extreme single-file outliers |
-| **Failover** | global → `STABLE_REGIONS` (same pool as DataRefiner / VertexProxy) |
 | **Reference hygiene** | `_sanitize_references()` drops any filename not present in the loaded corpus |
 
-**Three academic indicators the LLM must evaluate:**
+**Map tasks (3 parallel `asyncio.gather` calls):**
+
+| Task | Prompt focus | JSON key | Start region | Failover chain |
+|------|----------------|----------|--------------|----------------|
+| A | Structural Holes only | `structural_holes` | `europe-west4` | → `us-central1` → `us-east4` → `asia-northeast1` |
+| B | High-Degree Limitations only | `high_degree_limitations` | `us-east4` | → `asia-northeast1` → `us-central1` → `europe-west4` |
+| C | Orphaned Solutions only | `orphaned_solutions` | `asia-northeast1` | → `us-central1` → `europe-west4` → `us-east4` |
+
+Each map task receives the same payload sections:
+
+```
+_PROMPT_<CATEGORY>
+--- GRAPH TOPOLOGY ---   (full _build_topology_summary)
+--- SOURCE DOCUMENTS --- (<<<FILE: name>>> ... <<<END FILE>>> blocks)
+```
+
+* `max_output_tokens=16384` per category call.
+* Vertex `generate_content` runs in `asyncio.to_thread` (sync SDK, async orchestration).
+* Per-task 429 / `ResourceExhausted` → retry next region in that task’s chain only; other concurrent tasks are unaffected.
+
+**Reduce step (sequential, after gather):**
+
+| Step | Detail |
+|------|--------|
+| **Merge** | `_merge_analysis_results()` combines the three category arrays into one `academic_gap_analysis` object |
+| **Summary** | `_generate_executive_summary_async()` — fourth call on a compact findings digest (`max_output_tokens=2048`); regions: `global` → `us-central1` → `europe-west4` → `us-east4` |
+| **Fallback** | If summary regions exhaust, `_fallback_summary_from_findings()` builds text from top entries |
+
+**Three academic indicators (one per map task):**
 
 1. **Structural Holes** — Loosely connected or disconnected communities; bridging FYP opportunities.
 2. **High-Degree Limitation Nodes** — Limitation/challenge nodes with multi-source incoming evidence.
 3. **Orphaned Solutions** — Solution nodes with outgoing edges to failure/drawback conditions.
 
-**Prompt sections sent to Gemini:**
+**Stdout progress examples:**
 
 ```
-_TOPOLOGY_PROMPT
---- GRAPH TOPOLOGY ---   (full _build_topology_summary)
---- SOURCE DOCUMENTS --- (<<<FILE: name>>> ... <<<END FILE>>> blocks)
+PROGRESS: Phase 4.5 — Map-Reduce: 3 parallel category analyses + executive summary...
+PROGRESS: Phase 4.5 — loaded N source files (async I/O).
+PROGRESS: Phase 4.5 — routing Structural Holes to europe-west4...
+PROGRESS: Phase 4.5 — ✓ High-Degree Limitations complete via us-east4 (4 entries).
+PROGRESS: Phase 4.5 — routing Executive Summary to global...
+PROGRESS: Phase 4.5 — ✓ academic gap analysis complete.
 ```
 
 ---
@@ -252,7 +286,7 @@ Live progress lines (`PROGRESS: Phase X — ...`) are streamed to the Swift cons
 
 ```json
 {
-  "summary": "Executive summary (3–5 sentences)",
+  "summary": "Executive summary (2–4 sentences, from reduce-step digest call)",
   "structural_holes": [
     {
       "title": "string",
@@ -359,7 +393,7 @@ Backend/
 │   ├── InputAnalyzer.py             # Phase 1.5
 │   ├── DataRefiner.py               # Phase 2.5
 │   ├── AgentSynthesizer.py          # Phase 3
-│   └── GraphAnalyzer.py             # Phase 4.5 (full-corpus)
+│   └── GraphAnalyzer.py             # Phase 4.5 (Map-Reduce, async corpus I/O)
 └── infrastructure/
     ├── VertexProxy.py               # FastAPI :8000; Llama 4 Scout + pinned Gemini routing
     ├── GraphifyRunner.py            # Phase 4 shell + post-process
@@ -385,9 +419,11 @@ Backend/
 
 ### Multi-Region Failover (`STABLE_REGIONS`)
 
-Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `InputAnalyzer` (URL extraction), `IngestSeedUseCase`, and **`GraphAnalyzer`**.
+Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `InputAnalyzer` (URL extraction), and `IngestSeedUseCase`.
 
-Primary: `global` → sequential failover:
+**GraphAnalyzer (Phase 4.5)** uses **per-category regional sharding** (see Phase 4.5 table) instead of a single global → `STABLE_REGIONS` waterfall. The executive-summary call uses its own smaller region plan starting at `global`.
+
+**Other modules** — primary: `global` → sequential failover:
 
 * `europe-west4`
 * `us-east4`
@@ -398,15 +434,16 @@ Primary: `global` → sequential failover:
 
 ### Concurrency
 
-| Phase | Mechanism | Workers |
-|-------|-----------|---------|
+| Phase | Mechanism | Parallelism |
+|-------|-----------|-------------|
 | 2 | `ThreadPoolExecutor` | 3 (Social, Academic, Wiki) |
-| 2.6 | `ThreadPoolExecutor` + `Lock` | 5 |
+| 2.6 | `ThreadPoolExecutor` + `Lock` | 5 URL refine workers |
+| 4.5 | `asyncio.gather` + `asyncio.to_thread` | 3 category map tasks; async corpus reads; 1 summary call after merge |
 
 ### Rate-limit & fail-fast
 
 * DataRefiner exhaustion → `RuntimeError` → orchestrator skips corrupt markdown writes
-* GraphAnalyzer exhaustion → empty analysis payload with `error` string; graph still loads in UI
+* GraphAnalyzer: per-category regional failover; partial map failure → empty array for that category + `error` string; total map failure → `_empty_analysis()`; graph still loads in UI
 
 ---
 
@@ -426,8 +463,10 @@ Primary: `global` → sequential failover:
 ### Phase 4.5 / gap-analysis rules
 
 1. **Corpus fidelity** — Always pass `current_run_files` from the orchestrator; never analyze stale disk files outside the run queue.
-2. **Reference integrity** — Only filenames actually loaded in `_load_source_corpus` may appear in `references`; Python sanitizes LLM output before bridging.
-3. **UI layering** — Summary metrics in `GapAnalysisPanel`; deep content and source links in `FullDetailWindow` + `MarkdownViewer`.
+2. **Reference integrity** — Only filenames actually loaded in `_load_source_corpus_async` may appear in `references`; Python sanitizes LLM output before bridging.
+3. **Map-Reduce contract** — Do not collapse Phase 4.5 back into a single mega-prompt; keep three category-specific map tasks plus the digest-based summary reduce step.
+4. **Regional isolation** — A 429 in one category’s region must only advance that task’s failover chain, not block sibling `asyncio.gather` tasks.
+5. **UI layering** — Summary metrics in `GapAnalysisPanel`; deep content and source links in `FullDetailWindow` + `MarkdownViewer`.
 
 ### File system integrity
 
@@ -462,5 +501,5 @@ Optional: `BRIDGE_SCRIPT_PATH` env var overrides `execute_pipeline.sh` location 
 | 2.6 | `IngestSeedUseCase` workers | `*_URLRefiner.md` |
 | 3 | `AgentSynthesizer.py` | `processed_summaries/*.md` |
 | 4 | `GraphifyRunner.py` | `graphify-out/graph.{json,html}` |
-| 4.5 | `GraphAnalyzer.py` | `academic_gap_analysis` in PIPELINE_RESULT |
+| 4.5 | `GraphAnalyzer.py` | `academic_gap_analysis` (3 parallel map + summary reduce) |
 | UI | `ContentView` + panels | Graph + gap summary + source viewer |

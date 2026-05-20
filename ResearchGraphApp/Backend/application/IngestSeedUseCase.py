@@ -51,6 +51,25 @@ from application.GraphAnalyzer import analyze_graph_topology
 
 logger = logging.getLogger(__name__)
 
+
+def _ensure_all_saved_md_in_run_queue(
+    saved_files: list[str],
+    current_run_files: list[Path],
+) -> None:
+    """Register every .md from this run so Phase 4 / 4.5 see the full corpus."""
+    seen = {p.resolve() for p in current_run_files}
+    for entry in saved_files:
+        try:
+            p = Path(entry).resolve()
+        except (TypeError, OSError, ValueError):
+            continue
+        if p.suffix.lower() != ".md" or not p.is_file():
+            continue
+        if p not in seen:
+            current_run_files.append(p)
+            seen.add(p)
+
+
 # ── Concurrency Tuning ──────────────────────────────────────────────────────
 _PHASE2_WORKERS = 3        # Social, Academic, Wiki in parallel
 _PHASE26_MAX_WORKERS = 5   # Cap for recursive URL refinement
@@ -349,6 +368,7 @@ def execute(idea: str, url: str) -> dict:
     # Save Phase 2 results to disk
     path = save_markdown("raw_ingestion", primary_keyword, social_md)
     saved_files.append(str(path))
+    current_run_files.append(path.resolve())
 
     path = save_markdown("agent_scrapes", primary_keyword, wiki_md)
     saved_files.append(str(path))
@@ -455,11 +475,24 @@ def execute(idea: str, url: str) -> dict:
         f"## Refined Research Data (current session)\n{refined_data}"
     )
 
-    synthesis: str = synthesize_context(full_context)
-    path = save_markdown("processed_summaries", primary_keyword, synthesis)
-    saved_files.append(str(path))
-    current_run_files.append(path.resolve())
-    print("PROGRESS: Phase 3 — ✓ synthesis saved.", flush=True)
+    synthesis: str = ""
+    try:
+        synthesis = synthesize_context(full_context)
+        path = save_markdown("processed_summaries", primary_keyword, synthesis)
+        saved_files.append(str(path))
+        current_run_files.append(path.resolve())
+        print("PROGRESS: Phase 3 — ✓ synthesis saved.", flush=True)
+    except RuntimeError as syn_err:
+        print(f"PROGRESS: Phase 3 — ⚠ synthesis skipped: {syn_err}", flush=True)
+        logger.error("Phase 3: AgentSynthesizer exhausted — %s", syn_err)
+
+    # Full-session corpus for Graphify + Phase 4.5 (all .md written this run)
+    _ensure_all_saved_md_in_run_queue(saved_files, current_run_files)
+    print(
+        f"PROGRESS: Session corpus — {len(current_run_files)} Markdown files "
+        f"queued for graph + gap analysis.",
+        flush=True,
+    )
 
     # ── Phase 4: Knowledge Graph Generation ──────────────────────────────
     print("PROGRESS: Phase 4 — generating knowledge graph...", flush=True)
@@ -473,6 +506,9 @@ def execute(idea: str, url: str) -> dict:
         graphify_error = str(e)
 
     graph_path_abs = get_kb_root() / "graphify-out" / "graph.html"
+    graph_path_str: str | None = None
+    if graphify_error is None and graph_path_abs.is_file():
+        graph_path_str = str(graph_path_abs.resolve())
 
     if graphify_error:
         print(f"PROGRESS: Phase 4 — ✗ graphify error: {graphify_error}", flush=True)
@@ -496,15 +532,25 @@ def execute(idea: str, url: str) -> dict:
             "error": graphify_error,
         }
 
+    if graphify_error is None:
+        phase_label = "Phase 4.5 — Academic Gap Analysis Complete"
+        message = "Research pipeline completed successfully."
+    else:
+        phase_label = "Phase 4 — Knowledge Graph failed"
+        message = (
+            "Research pipeline finished; knowledge graph was not generated. "
+            f"{graphify_error}"
+        )
+
     # Swift bridging contract — extends payload with academic_gap_analysis
     # and kb_root so the SwiftUI MarkdownViewer can resolve reference
     # filenames to absolute paths on disk.
     return {
         "status": "success",
-        "message": "Research pipeline completed successfully.",
-        "graph_path": str(graph_path_abs.resolve()),
+        "message": message,
+        "graph_path": graph_path_str,
         "kb_root": str(get_kb_root().resolve()),
-        "phase": "Phase 4 — Knowledge Graph Generation Complete",
+        "phase": phase_label,
         "seed_analysis": {
             "core_context": core_context,
             "search_keywords": search_keywords,

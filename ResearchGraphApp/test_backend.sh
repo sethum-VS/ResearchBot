@@ -59,11 +59,15 @@ if ! curl -s http://localhost:3002 > /dev/null; then
 
     echo "🐳 Starting Firecrawl via Docker Compose..."
     cd "$FIRECRAWL_DIR"
-    docker compose up -d
-    FIRECRAWL_STARTED=true
-    cd "$SCRIPT_DIR"
-    echo "⏳ Waiting for Firecrawl to initialize (15s)..."
-    sleep 15
+    if docker compose up -d; then
+        FIRECRAWL_STARTED=true
+        cd "$SCRIPT_DIR"
+        echo "⏳ Waiting for Firecrawl to initialize (15s)..."
+        sleep 15
+    else
+        cd "$SCRIPT_DIR"
+        echo "⚠️  Firecrawl Docker failed (is Docker Desktop running?). Continuing with degraded web scraping."
+    fi
 else
     echo "✅ Firecrawl is running at localhost:3002."
 fi
@@ -71,6 +75,63 @@ fi
 # --- 3. Execute Pipeline via Bridge ---
 echo "🚀 Triggering Pipeline via execute_pipeline.sh..."
 cd "$SCRIPT_DIR"
+set +e
 ./execute_pipeline.sh --idea "AI Agents for Automated Code Review"
+PIPELINE_EXIT=$?
+set -e
+
+if [ "$PIPELINE_EXIT" -ne 0 ]; then
+    echo "❌ Pipeline exited with code $PIPELINE_EXIT"
+    exit "$PIPELINE_EXIT"
+fi
+
+# --- 4. Verify graph artifacts (nodes present in graph.json + graph.html) ---
+echo "🔍 Verifying knowledge graph artifacts..."
+"$BACKEND_DIR/.venv/bin/python3" <<VERIFY
+import json
+import re
+import sys
+from pathlib import Path
+
+kb = Path("$SCRIPT_DIR/research_knowledge_base/graphify-out")
+json_path = kb / "graph.json"
+html_path = kb / "graph.html"
+
+if not json_path.is_file():
+    print(f"❌ Missing {json_path}")
+    sys.exit(1)
+if not html_path.is_file():
+    print(f"❌ Missing {html_path}")
+    sys.exit(1)
+
+data = json.loads(json_path.read_text(encoding="utf-8"))
+nodes = data.get("nodes") or []
+links = data.get("links") or []
+if not nodes:
+    print("❌ graph.json has zero nodes")
+    sys.exit(1)
+
+if len(nodes) < 5:
+    print(f"⚠️  graph.json has only {len(nodes)} nodes (expected richer graph from corpus)")
+
+html = html_path.read_text(encoding="utf-8", errors="ignore")
+html_ids = set(re.findall(r'"id"\s*:\s*"([^"]+)"', html))
+json_ids = {n.get("id") for n in nodes if n.get("id")}
+missing_in_html = json_ids - html_ids
+extra_in_html = html_ids - json_ids
+
+print(f"✅ graph.json: {len(nodes)} nodes, {len(links)} links")
+print(f"✅ graph.html: {len(html_ids)} node id references in markup")
+
+if missing_in_html:
+    sample = sorted(missing_in_html)[:8]
+    print(f"⚠️  {len(missing_in_html)} node id(s) in graph.json not found in graph.html (sample: {sample})")
+    # Warn only — Graphify HTML layout may embed nodes differently
+else:
+    print("✅ All graph.json node ids appear in graph.html")
+
+sys.exit(0)
+VERIFY
+
 
 echo "✅ Backend test completed successfully."

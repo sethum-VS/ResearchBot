@@ -44,6 +44,15 @@ struct StructuralHole: Codable, Identifiable, Sendable, Hashable {
         case communitiesInvolved = "communities_involved"
         case bridgingOpportunity = "bridging_opportunity"
     }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        title = try c.decode(String.self, forKey: .title)
+        communitiesInvolved = try c.decodeIfPresent([String].self, forKey: .communitiesInvolved) ?? []
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        bridgingOpportunity = try c.decodeIfPresent(String.self, forKey: .bridgingOpportunity) ?? ""
+        references = try c.decodeIfPresent([String].self, forKey: .references)
+    }
 }
 
 struct HighDegreeLimitation: Codable, Identifiable, Sendable, Hashable {
@@ -59,6 +68,22 @@ struct HighDegreeLimitation: Codable, Identifiable, Sendable, Hashable {
         case title, description, degree, evidence, references
         case nodeLabels = "node_labels"
     }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        title = try c.decode(String.self, forKey: .title)
+        nodeLabels = try c.decodeIfPresent([String].self, forKey: .nodeLabels) ?? []
+        if let d = try? c.decode(Int.self, forKey: .degree) {
+            degree = d
+        } else if let d = try? c.decode(Double.self, forKey: .degree) {
+            degree = Int(d)
+        } else {
+            degree = nil
+        }
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        evidence = try c.decodeIfPresent(String.self, forKey: .evidence)
+        references = try c.decodeIfPresent([String].self, forKey: .references)
+    }
 }
 
 struct OrphanedSolution: Codable, Identifiable, Sendable, Hashable {
@@ -73,6 +98,15 @@ struct OrphanedSolution: Codable, Identifiable, Sendable, Hashable {
         case title, description, references
         case failureConditions = "failure_conditions"
         case technicalContribution = "technical_contribution"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        title = try c.decode(String.self, forKey: .title)
+        failureConditions = try c.decodeIfPresent([String].self, forKey: .failureConditions) ?? []
+        description = try c.decodeIfPresent(String.self, forKey: .description) ?? ""
+        technicalContribution = try c.decodeIfPresent(String.self, forKey: .technicalContribution) ?? ""
+        references = try c.decodeIfPresent([String].self, forKey: .references)
     }
 }
 

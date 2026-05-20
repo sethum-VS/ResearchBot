@@ -66,7 +66,7 @@ final class PythonBridge {
     // MARK: - Execution
 
     /// Runs the full pipeline asynchronously.
-    func runPipeline(idea: String) {
+    func runPipeline(idea: String, url: String = "") {
         guard !isRunning else { return }
         guard let script = scriptPath else {
             errorMessage = "Could not locate execute_pipeline.sh. Check repo structure."
@@ -82,14 +82,19 @@ final class PythonBridge {
         academicGapAnalysis = nil
 
         Task.detached(priority: .userInitiated) { [weak self] in
-            await self?.executeProcess(script: script, idea: idea)
+            await self?.executeProcess(script: script, idea: idea, url: url)
         }
     }
 
-    nonisolated private func executeProcess(script: String, idea: String) async {
+    nonisolated private func executeProcess(script: String, idea: String, url: String) async {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [script, "--idea", idea]
+        var args = [script, "--idea", idea]
+        let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedURL.isEmpty {
+            args += ["--url", trimmedURL]
+        }
+        process.arguments = args
 
         // Inherit the user's shell environment for GCP ADC, PATH, etc.
         var env = ProcessInfo.processInfo.environment
