@@ -85,13 +85,14 @@ final class PythonBridge {
 
         // Inherit the user's shell environment for GCP ADC, PATH, etc.
         var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+        let homeDir = NSHomeDirectory()
+        let localBin = "\(homeDir)/.local/bin"
+        env["PATH"] = "\(localBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
         process.environment = env
 
         let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
         process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
+        process.standardError = stdoutPipe
 
         // Stream stdout lines for live progress
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in

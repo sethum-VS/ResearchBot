@@ -510,6 +510,22 @@ def proxy(path: str, request: Request, body: dict = Body(...)):
     if is_json_mode and text_out:
         text_out = _strip_json_fences(text_out)
 
+    # ── Llama Debug Logging ──────────────────────────────────────────────
+    if model_name.startswith("llama") or "llama" in resolved_model:
+        try:
+            debug_log_path = Path(__file__).resolve().parent / "llama_debug.jsonl"
+            with open(debug_log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "timestamp": time.time(),
+                    "requested_model": model_name,
+                    "resolved_model": resolved_model,
+                    "prompt_messages": messages,
+                    "text_out": text_out,
+                    "finish_reason": finish_reason
+                }, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning("Failed to write to llama_debug.jsonl: %s", e)
+
     # Log a warning if the output was truncated — helps diagnose graph
     # generation failures without diving into Graphify's error stream.
     if finish_reason == "length":
