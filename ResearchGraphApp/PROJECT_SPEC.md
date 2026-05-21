@@ -12,7 +12,7 @@ and surfaces **actionable FYP angles** with **source-verifiable citations** back
 
 Simply rendering a knowledge graph is not sufficient. Phase **4.5 (Academic Graph Analyzer)** actively guides students on *how* to read graph topology—structural holes, validated limitation nodes, and orphaned solutions—grounded in the full source text of the current pipeline run.
 
-The workbench also provides **workspace run isolation** (every execution writes to a dedicated timestamped folder) and an **interactive Graph Explorer Console** (`graphify query` / `graphify path`) for live topology interrogation against any historical session.
+The workbench also provides **workspace run isolation** (every execution writes to a dedicated timestamped folder), an **interactive Graph Explorer Console** (`graphify query` / `graphify path`) for live topology interrogation against any historical session, and **Google Workspace Export** — a post-pipeline action that pushes each run’s Markdown corpus and Phase 4.5 gap analysis into the user’s personal Google Drive via **OAuth 2.0 Desktop App** flow (not a service account).
 
 ---
 
@@ -24,6 +24,7 @@ The workbench also provides **workspace run isolation** (every execution writes 
 | **Frontend** | SwiftUI (`@Observable`), `WKWebView` (Graphify HTML), native Markdown viewer, `URLSession` → VertexProxy graph APIs |
 | **Backend** | Python 3.10+, subprocess bridge via `execute_pipeline.sh` → `main.py` |
 | **Local proxy** | `VertexProxy.py` (FastAPI on port 8000) — OpenAI-compatible bridge to Vertex AI; hosts `/api/graph/*` interactive endpoints |
+| **Google Workspace** | `google-api-python-client`, `google-auth-oauthlib`, `google-auth` — Drive + Docs APIs; OAuth desktop flow writes to the signed-in user’s Drive |
 
 ### AI Models
 
@@ -39,6 +40,16 @@ The workbench also provides **workspace run isolation** (every execution writes 
 * **Semantic Scholar API** — Keyless Academic Graph `/paper/search` (primary academic source in Phase 2)
 * **Tavily API** — Social leads (Reddit/X); secondary academic domain search (merged with S2 in `AcademicScraper.py`)
 * **MediaWiki API** — Foundational definitions and Wiki context
+
+### Google Workspace (Export)
+
+| Item | Detail |
+|------|--------|
+| **Auth model** | OAuth 2.0 Desktop (`InstalledAppFlow`) — end-user consent; **not** a service account |
+| **Client secrets** | `credentials.json` bundled in the macOS app (`App/ResearchBot/credentials.json`, gitignored) |
+| **Token storage** | `~/Library/Application Support/ResearchBot/token.json` (persisted after first browser login) |
+| **Scopes** | `drive`, `documents` |
+| **Drive layout** | Per-run topic folder + shared **Master Tracking Document** at Drive root |
 
 ---
 
@@ -85,6 +96,11 @@ graph TD
     V --> GT[GraphTerminalView]
     GT -->|POST /api/graph/query or /path| VP[VertexProxy :8000]
     VP --> M
+
+    A -->|Export button| GW[GoogleWorkspaceExportView]
+    GW -->|Process export_to_workspace| EX[ExportWorkspaceUseCase]
+    EX --> GWM[GoogleWorkspaceManager.py]
+    GWM -->|OAuth + Drive/Docs| GD[User Google Drive]
 ```
 
 ### Execution Bridge
@@ -93,14 +109,18 @@ graph TD
 SwiftUI (PythonBridge)
     ├── HistoryView — enumerate runs/session_* on disk; load historical graph + gap JSON
     ├── InputView — runPipeline(idea:) → Process
-    └── GraphTerminalView — URLSession POST → VertexProxy /api/graph/query|path
+    ├── GraphTerminalView — URLSession POST → VertexProxy /api/graph/query|path
+    └── exportToWorkspace(sessionId:kbRoot:) → Process (export command)
 
 execute_pipeline.sh [--idea "..."] [--url "..."]
     ├── Activates Backend/.venv
     ├── Starts VertexProxy (uvicorn :8000) if not running
-    └── python3 main.py → IngestSeedUseCase.execute()
-            ├── FileStorage.create_session_dir(idea)  → RESEARCHBOT_SESSION_DIR
-            └── stdout: PROGRESS lines + ---PIPELINE_RESULT_START--- JSON
+    └── python3 main.py [args]
+            ├── Default: IngestSeedUseCase.execute()
+            │       ├── FileStorage.create_session_dir(idea)  → RESEARCHBOT_SESSION_DIR
+            │       └── stdout: PROGRESS lines + ---PIPELINE_RESULT_START--- JSON
+            └── --command export_to_workspace --session-id ... --kb-root ...
+                    └── ExportWorkspaceUseCase → ---WORKSPACE_EXPORT_RESULT_START--- JSON
 ```
 
 ---
@@ -257,6 +277,35 @@ PROGRESS: Phase 4.5 — ✓ High-Degree Limitations complete via us-east4 (4 ent
 PROGRESS: Phase 4.5 — ✓ academic gap analysis complete.
 ```
 
+### Google Workspace Export (on-demand, post-pipeline)
+
+Triggered from the SwiftUI app **after** a session has completed Phase 4.5 (requires `academic_gap_analysis.json` on disk). Not part of the default pipeline run; invoked via `main.py --command export_to_workspace`.
+
+| Item | Detail |
+|------|--------|
+| **Module** | `GoogleWorkspaceManager.export_session_to_workspace()` via `ExportWorkspaceUseCase.export_to_workspace()` |
+| **Entry** | `main.py --command export_to_workspace --session-id <id> [--kb-root <abs path>]` |
+| **Auth** | `InstalledAppFlow.from_client_secrets_file()`; first run opens the system browser for consent |
+| **Credentials resolution** | `RESEARCHBOT_OAUTH_CREDENTIALS` (Swift sets from app bundle) → `~/Library/Application Support/ResearchBot/credentials.json` → dev path `App/ResearchBot/credentials.json` |
+| **Token path** | `~/Library/Application Support/ResearchBot/token.json` |
+| **Prerequisite** | `session_dir/academic_gap_analysis.json` must exist |
+
+**Export steps (Python only):**
+
+1. **Authenticate** — Load or refresh OAuth token; persist to Application Support on first login.
+2. **Topic folder** — Create `Run_<UTC_TIMESTAMP>_<slug>` in the user’s Drive root (slug from `session_manifest.json` or session dirname).
+3. **Reference upload** — Upload every `agent_scrapes/*.md` into the topic folder; collect shareable `webViewLink` URLs.
+4. **Topic document** — Create a Google Doc in the topic folder; insert formatted Phase 4.5 payload (`summary`, structural holes, limitations, orphaned solutions) plus a **Reference Materials** section with bulleted links to uploaded Markdown files.
+5. **Master tracker** — Find or create `ResearchBot — Master Tracking Document` (Google Doc at Drive root); **prepend** a block with session id, topic, export timestamp, executive summary excerpt, and hyperlinks to the topic doc and folder.
+
+**Stdout contract** (no `PROGRESS:` streaming; single JSON envelope):
+
+```
+---WORKSPACE_EXPORT_RESULT_START---
+{ ... }
+---WORKSPACE_EXPORT_RESULT_END---
+```
+
 ### Session Manifest (orchestrator-written)
 
 After Phase 3, `IngestSeedUseCase` writes `session_dir/session_manifest.json`:
@@ -404,6 +453,39 @@ graphify path   <session_dir/graphify-out>  "<source>"  "<target>"
 
 VertexProxy must remain running (started by `execute_pipeline.sh`) for live console queries from the app.
 
+### Workspace export markers
+
+Python prints the export payload between:
+
+```
+---WORKSPACE_EXPORT_RESULT_START---
+{ ... JSON ... }
+---WORKSPACE_EXPORT_RESULT_END---
+```
+
+Invoked by Swift via:
+
+```bash
+execute_pipeline.sh --command export_to_workspace \
+  --session-id "session_20260520T235831Z_topic_slug" \
+  --kb-root "/abs/path/research_knowledge_base"
+```
+
+Swift sets `RESEARCHBOT_OAUTH_CREDENTIALS` to the bundled `credentials.json` path before spawning the process.
+
+### Workspace export success schema (`ExportWorkspaceUseCase`)
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `status` | string | `"success"` or `"error"` |
+| `message` | string | Human-readable result |
+| `master_document_url` | string | Shareable URL to the Master Tracking Document (primary link shown in UI) |
+| `topic_document_url` | string | URL to the per-run Gap Analysis Google Doc |
+| `topic_folder_url` | string | URL to the per-run Drive folder |
+| `session_id` | string | Canonical session directory basename |
+
+On `status == "error"`, the process exits with code `1` (missing session, missing gap JSON, OAuth failure, or API error).
+
 ---
 
 ## 7. SwiftUI Frontend Architecture
@@ -420,7 +502,8 @@ VertexProxy must remain running (started by `execute_pipeline.sh`) for live cons
 | `PythonBridge.swift` | `Process()` → `execute_pipeline.sh`; parses `PipelineResult`; `URLSession` graph console |
 | `GraphTerminalView.swift` | Interactive console: macros, path finder, transcript |
 | `GapAnalysisPanel.swift` | Concise right-side summary (metrics + CTA) |
-| `FullDetailWindow.swift` | Sheet: full gap breakdown + reference navigation |
+| `FullDetailWindow.swift` | Full-screen gap breakdown + reference navigation + **Export to Google Workspace** |
+| `GoogleWorkspaceExportView.swift` | Shared export button, OAuth-wait progress, success/error alerts |
 | `MarkdownViewer.swift` | Native Markdown reader for source verification |
 
 ### Screen flow
@@ -428,6 +511,7 @@ VertexProxy must remain running (started by `execute_pipeline.sh`) for live cons
 ```
 HistoryView (initial landing)
   ├── Card grid: timestamp, topic, URLRefiner count, session id
+  ├── Per-card "Export to Google Workspace" (doc.badge.arrow.up)
   ├── Tap card → PythonBridge.loadHistoricalSession() → GraphView
   └── "New Research" → InputView
 
@@ -446,10 +530,17 @@ GraphView (HSplitView + optional bottom console)
         ├── Metric chips (hole / limitation / orphaned counts)
         └── "View Full Analysis" → .sheet(FullDetailWindow)
 
-FullDetailWindow (NavigationStack)
+FullDetailWindow (full-screen page from GraphView)
+  ├── Toolbar: Export to Google Workspace (prominent), Close
   ├── Category cards with references as clickable capsules
   ├── Indexed Sources footer
   └── on reference tap → MarkdownViewer (in-place push)
+
+GoogleWorkspaceExportView (shared component)
+  ├── While exporting + no token.json → ProgressView + "Waiting for Google Login in Browser…"
+  ├── While exporting + token exists → "Exporting to Google Workspace…"
+  ├── Success alert → "Open Master Document" (NSWorkspace opens master_document_url)
+  └── Error alert → backend message from workspace export JSON
 
 MarkdownViewer
   ├── Resolves filename under kb_root (recursive search, including session subfolders)
@@ -470,8 +561,14 @@ MarkdownViewer
 | `academicGapAnalysis` | `academic_gap_analysis` or `session_dir/academic_gap_analysis.json` (historical load) |
 | `synthesisPreview` | `synthesis_preview` |
 | `errorMessage` | `status == "error"` or decode failure |
+| `isExportingWorkspace` | Workspace export `Process` lifecycle |
+| `workspaceExportMessage` | Success message from export JSON |
+| `workspaceExportError` | Export failure message |
+| `masterDocumentURL` | `master_document_url` from export JSON |
 
 **Historical reload:** `loadHistoricalSession(_:)` sets `graphFilePath`, `sessionId`, `sessionPath`, `kbRoot`, and decodes `academic_gap_analysis.json` from the session folder.
+
+**Workspace export:** `exportToWorkspace(sessionId:kbRoot:)` spawns `execute_pipeline.sh` with `--command export_to_workspace`. Parses `---WORKSPACE_EXPORT_RESULT_*---` markers (same pattern as pipeline JSON). Token presence is checked at `~/Library/Application Support/ResearchBot/token.json` via `PythonBridge.hasGoogleOAuthToken` (UI only; Python performs actual OAuth).
 
 **Graph console:** `runGraphQuery(question:)` and `runGraphPath(source:target:)` POST to `http://localhost:8000/api/graph/...` (300s timeout).
 
@@ -480,6 +577,7 @@ MarkdownViewer
 * `AcademicGapAnalysis` — root payload
 * `StructuralHole`, `HighDegreeLimitation`, `OrphanedSolution` — category entries with optional `references: [String]`
 * `PipelineResult` — includes `sessionId`, `sessionPath` (`PythonBridge.swift`)
+* `WorkspaceExportResult` — `masterDocumentURL`, `topicDocumentURL`, `topicFolderURL` (`PythonBridge.swift`)
 
 ---
 
@@ -487,14 +585,16 @@ MarkdownViewer
 
 ```
 Backend/
-├── main.py                          # CLI entry; PIPELINE_RESULT envelope
+├── main.py                          # CLI entry; pipeline + export_to_workspace commands
 ├── application/
 │   ├── IngestSeedUseCase.py         # Orchestrator; create_session_dir; manifest + gap JSON persist
+│   ├── ExportWorkspaceUseCase.py    # export_to_workspace(session_id, kb_root)
 │   ├── InputAnalyzer.py             # Phase 1.5
 │   ├── DataRefiner.py               # Phase 2.5
 │   ├── AgentSynthesizer.py          # Phase 3
 │   └── GraphAnalyzer.py             # Phase 4.5 (Map-Reduce, async corpus I/O)
 └── infrastructure/
+    ├── GoogleWorkspaceManager.py    # OAuth, Drive folder/doc upload, master tracker
     ├── VertexProxy.py               # FastAPI :8000; /api/graph/* + OpenAI proxy
     ├── GraphifyRunner.py            # Phase 4; execute_graph_query; execute_graph_path
     ├── FileStorage.py               # Session dirs, save_markdown, RESEARCHBOT_SESSION_DIR
@@ -508,7 +608,7 @@ Backend/
 
 | Script | Role |
 |--------|------|
-| `execute_pipeline.sh` | venv activate, VertexProxy lifecycle, `main.py "$@"` |
+| `execute_pipeline.sh` | venv activate, VertexProxy lifecycle, `main.py "$@"` (pipeline or `export_to_workspace`) |
 | `run.sh` | GCP + Firecrawl checks, Xcode build, launch `.app` (no graph path verification) |
 | `clean_kb.sh` | Deep-clean contents of each top-level KB subfolder (including `runs/`) |
 | `test_backend.sh` | Full pipeline smoke test; verifies artefacts via `session_path` from PIPELINE_RESULT JSON |
@@ -578,6 +678,15 @@ Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `Input
 5. **UI layering** — Summary metrics in `GapAnalysisPanel`; deep content and source links in `FullDetailWindow` + `MarkdownViewer`.
 6. **Persist for HistoryView** — Write `academic_gap_analysis.json` beside the session graph so archival runs reload without re-running Phase 4.5.
 
+### Google Workspace export rules
+
+1. **Swift/Python boundary** — Swift only spawns the export process, passes `session_id` / `kb_root`, sets `RESEARCHBOT_OAUTH_CREDENTIALS`, and parses JSON. All Drive/Docs/OAuth logic lives in `GoogleWorkspaceManager.py`.
+2. **No service accounts** — Use OAuth desktop flow only; tokens belong to the end-user’s Google account.
+3. **Secrets hygiene** — `credentials.json` and `token.json` are gitignored; never commit OAuth client secrets or refresh tokens.
+4. **Export prerequisite** — Require persisted `academic_gap_analysis.json`; do not export sessions that never completed Phase 4.5.
+5. **Master doc naming** — Fixed title `ResearchBot — Master Tracking Document`; search Drive by exact name before creating.
+6. **First-login UX** — Swift shows browser-wait copy when `token.json` is absent; Python opens the default browser via `run_local_server(port=0)`.
+
 ### File system integrity
 
 1. **Folder preservation** — `clean_kb.sh` clears contents inside top-level KB subfolders but preserves the folder structure.
@@ -596,6 +705,9 @@ Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `Input
 | Firecrawl Docker | Phase 2 / 2.6 crawling |
 | Graphify CLI | Phase 4 + interactive query/path |
 | Xcode 26+ | macOS app target `ResearchBot` |
+| Google Cloud OAuth Desktop client | `credentials.json` in app bundle (Drive + Docs scopes enabled in Cloud Console) |
+
+**Python packages (workspace export):** `google-api-python-client`, `google-auth-oauthlib`, `google-auth-httplib2` (see `Backend/requirements.txt`).
 
 Optional environment variables:
 
@@ -604,7 +716,15 @@ Optional environment variables:
 | `BRIDGE_SCRIPT_PATH` | Overrides `execute_pipeline.sh` location for Xcode schemes |
 | `RESEARCHBOT_SESSION_DIR` | Set by Python orchestrator; absolute active session path |
 | `RESEARCHBOT_KB_ROOT` | Optional override for Swift `HistoryView` KB discovery |
+| `RESEARCHBOT_OAUTH_CREDENTIALS` | Absolute path to OAuth `credentials.json` (set by Swift on export) |
 | `GRAPHIFY_TOKEN_BUDGET` | Per-chunk Graphify extraction budget (default `8192`) |
+
+**macOS Application Support (user-local, not in repo):**
+
+| Path | Purpose |
+|------|---------|
+| `~/Library/Application Support/ResearchBot/token.json` | OAuth refresh/access token (created on first export login) |
+| `~/Library/Application Support/ResearchBot/credentials.json` | Optional override for desktop client secrets |
 
 ---
 
@@ -621,6 +741,8 @@ Optional environment variables:
 | 3b | `IngestSeedUseCase` | `session_manifest.json` |
 | 4 | `GraphifyRunner.py` | `graphify-out/graph.{json,html}` |
 | 4.5 | `GraphAnalyzer.py` | `academic_gap_analysis` JSON (+ persisted `.json`) |
-| UI | `HistoryView` | Archive browser + historical graph reload |
+| Export | `GoogleWorkspaceManager.py` | Drive topic folder, topic Doc, master tracker update |
+| UI | `HistoryView` | Archive browser + historical graph reload + per-card export |
 | UI | `GraphTerminalView` | Live `graphify query` / `path` via VertexProxy |
 | UI | `ContentView` + panels | Graph + gap summary + source viewer |
+| UI | `GoogleWorkspaceExportView` | OAuth-aware export trigger + master doc link |
