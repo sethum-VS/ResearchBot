@@ -7,21 +7,18 @@ This guarantees absolute historical preservation and zero cross-run artifact
 bleed: Phase 2 scrapers, Phase 2.6 URLRefiners, Phase 3 synthesizers, and
 Phase 4 Graphify all write *exclusively* to their matching session subtree.
 
-Layout
+Layout (single knowledge-base root)
 ──────
 research_knowledge_base/
-├── runs/
-│   ├── session_20260520T231844Z_ai_ethics/
-│   │   ├── agent_scrapes/
-│   │   ├── raw_ingestion/
-│   │   ├── processed_summaries/
-│   │   └── graphify-out/
-│   │       ├── graph.html
-│   │       ├── graph.json
-│   │       └── GRAPH_REPORT.md
-│   └── session_20260521T091233Z_quantum_routing/
-│       └── ...
-└── .archive_legacy/   (untouched: pre-session shared folders)
+└── runs/
+    └── session_<UTC_TIMESTAMP>_<slug>/
+        ├── agent_scrapes/
+        ├── raw_ingestion/
+        ├── processed_summaries/
+        └── graphify-out/
+            ├── graph.html
+            ├── graph.json
+            └── GRAPH_REPORT.md
 """
 
 import os

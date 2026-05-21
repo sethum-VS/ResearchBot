@@ -66,18 +66,31 @@ final class PythonBridge {
 
     // MARK: - Script Resolution
 
-    private var scriptPath: String? {
+    private var researchGraphAppRoot: URL? {
         if let envPath = ProcessInfo.processInfo.environment["BRIDGE_SCRIPT_PATH"] {
-            if FileManager.default.fileExists(atPath: envPath) { return envPath }
+            let url = URL(fileURLWithPath: envPath).deletingLastPathComponent()
+            if FileManager.default.fileExists(atPath: url.path) { return url }
         }
 
         var current = URL(fileURLWithPath: Bundle.main.bundlePath)
         for _ in 0..<10 {
-            let candidate = current.appendingPathComponent("execute_pipeline.sh").path
-            if FileManager.default.fileExists(atPath: candidate) { return candidate }
+            let marker = current.appendingPathComponent("execute_pipeline.sh")
+            if FileManager.default.fileExists(atPath: marker.path) { return current }
             current = current.deletingLastPathComponent()
         }
         return nil
+    }
+
+    private var scriptPath: String? {
+        guard let root = researchGraphAppRoot else { return nil }
+        let path = root.appendingPathComponent("execute_pipeline.sh").path
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    private var ensureProxyScriptPath: String? {
+        guard let root = researchGraphAppRoot else { return nil }
+        let path = root.appendingPathComponent("ensure_vertex_proxy.sh").path
+        return FileManager.default.fileExists(atPath: path) ? path : nil
     }
 
     // MARK: - Pipeline Execution
@@ -202,8 +215,7 @@ final class PythonBridge {
     /// sub-folder doesn't exist or no run is active. Results are sorted by
     /// filename (case-insensitive) for stable UI ordering.
     func listMarkdownFiles(in subfolder: String) -> [URL] {
-        let base = sessionPath ?? kbRoot
-        guard let base, !base.isEmpty else { return [] }
+        guard let base = sessionPath, !base.isEmpty else { return [] }
         return PythonBridge.listMarkdownFiles(in: subfolder, under: base)
     }
 
@@ -286,8 +298,88 @@ final class PythonBridge {
         )
     }
 
+    /// Starts VertexProxy when opening a historical session or after pipeline teardown.
+    private func ensureVertexProxyRunning() async -> Result<Void, Error> {
+        if await isVertexProxyReachable() {
+            return .success(())
+        }
+
+        guard let script = ensureProxyScriptPath else {
+            return .failure(GraphConsoleError.proxyNotRunning)
+        }
+
+        let launched: Result<Void, Error> = await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/bash")
+            process.arguments = [script]
+
+            var env = ProcessInfo.processInfo.environment
+            let homeDir = NSHomeDirectory()
+            let localBin = "\(homeDir)/.local/bin"
+            env["PATH"] = "\(localBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+            process.environment = env
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            process.terminationHandler = { proc in
+                if proc.terminationStatus == 0 {
+                    continuation.resume(returning: .success(()))
+                } else {
+                    let detail = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    let msg = detail?.isEmpty == false ? detail! : "exit \(proc.terminationStatus)"
+                    continuation.resume(returning: .failure(GraphConsoleError.proxyStartFailed(msg)))
+                }
+            }
+
+            do {
+                try process.run()
+            } catch {
+                continuation.resume(returning: .failure(error))
+            }
+        }
+
+        switch launched {
+        case .failure(let err):
+            return .failure(err)
+        case .success:
+            if await isVertexProxyReachable() {
+                return .success(())
+            }
+            return .failure(GraphConsoleError.proxyNotRunning)
+        }
+    }
+
+    private func isVertexProxyReachable() async -> Bool {
+        var request = URLRequest(url: proxyBaseURL.appendingPathComponent("api/graph/sessions"))
+        request.httpMethod = "GET"
+        request.timeoutInterval = 3
+
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return false }
+            return (200...299).contains(http.statusCode)
+        } catch {
+            return false
+        }
+    }
+
+    private func consoleRequestURL(path: String) -> URL {
+        let trimmed = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        return proxyBaseURL.appendingPathComponent(trimmed)
+    }
+
     private func postConsole(path: String, body: [String: String]) async -> Result<String, Error> {
-        var request = URLRequest(url: proxyBaseURL.appendingPathComponent(path))
+        switch await ensureVertexProxyRunning() {
+        case .failure(let err):
+            return .failure(err)
+        case .success:
+            break
+        }
+
+        var request = URLRequest(url: consoleRequestURL(path: path))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 300
@@ -299,13 +391,26 @@ final class PythonBridge {
         }
 
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+                if let decoded = try? JSONDecoder().decode(GraphConsoleResponse.self, from: data),
+                   let err = decoded.error {
+                    return .failure(GraphConsoleError.backend(err))
+                }
+                return .failure(GraphConsoleError.backend("HTTP \(http.statusCode)"))
+            }
+
             let decoded = try JSONDecoder().decode(GraphConsoleResponse.self, from: data)
             if decoded.ok, let stdout = decoded.stdout {
                 return .success(stdout)
             }
             return .failure(GraphConsoleError.backend(decoded.error ?? "Unknown backend error"))
         } catch {
+            if let urlError = error as? URLError,
+               [.cannotConnectToHost, .cannotFindHost, .networkConnectionLost, .timedOut]
+                   .contains(urlError.code) {
+                return .failure(GraphConsoleError.proxyNotRunning)
+            }
             return .failure(error)
         }
     }
@@ -313,12 +418,18 @@ final class PythonBridge {
 
 enum GraphConsoleError: LocalizedError {
     case noActiveSession
+    case proxyNotRunning
+    case proxyStartFailed(String)
     case backend(String)
 
     var errorDescription: String? {
         switch self {
         case .noActiveSession:
             return "No active research session. Run a pipeline or open a historical run first."
+        case .proxyNotRunning:
+            return "VertexProxy is not running on localhost:8000. Run a pipeline once or execute ensure_vertex_proxy.sh from ResearchGraphApp."
+        case .proxyStartFailed(let detail):
+            return "Failed to start VertexProxy: \(detail)"
         case .backend(let msg):
             return msg
         }

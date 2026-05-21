@@ -132,6 +132,133 @@ def _graphify_env() -> dict:
     return env
 
 
+def _graphify_token_budget() -> str:
+    """Per-chunk extraction budget (higher → more entities per source file)."""
+    return os.getenv("GRAPHIFY_TOKEN_BUDGET", "4096").strip() or "4096"
+
+
+def _raw_node_ids_from_html(html: str) -> set[str]:
+    """Parse vis-network RAW_NODES ids embedded in graph.html."""
+    match = re.search(r"const RAW_NODES = (\[.*?\]);", html, re.DOTALL)
+    if not match:
+        return set()
+    try:
+        raw = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return set()
+    return {n["id"] for n in raw if isinstance(n, dict) and n.get("id")}
+
+
+def _update_html_stats(html_path: Path, node_count: int, edge_count: int, community_count: int) -> None:
+    """Keep the sidebar stats footer aligned with graph.json."""
+    html = html_path.read_text(encoding="utf-8")
+    stats = (
+        f'{node_count} nodes &middot; {edge_count} edges '
+        f"&middot; {community_count} communities"
+    )
+    updated = re.sub(
+        r'(<div id="stats">)(.*?)(</div>)',
+        rf"\1{stats}\3",
+        html,
+        count=1,
+        flags=re.DOTALL,
+    )
+    if updated != html:
+        html_path.write_text(updated, encoding="utf-8")
+
+
+def _regenerate_graph_html(out_dir: Path) -> bool:
+    """
+    Re-run ``graphify cluster-only`` so graph.html is rebuilt from graph.json.
+    Returns True when the subprocess succeeds.
+    """
+    env = _graphify_env()
+    result = subprocess.run(
+        ["graphify", "cluster-only", str(out_dir)],
+        capture_output=True,
+        text=True,
+        cwd=str(out_dir.parent),
+        timeout=600,
+        env=env,
+    )
+    if result.returncode != 0:
+        logger.warning(
+            "graphify cluster-only failed while syncing html (%s): %s",
+            result.returncode,
+            (result.stderr or result.stdout or "").strip(),
+        )
+        return False
+    return True
+
+
+def _ensure_html_includes_all_json_nodes(out_dir: Path, graph_data: dict) -> None:
+    """
+    Guarantee every node in graph.json appears in graph.html RAW_NODES.
+    Regenerates the visualization when Graphify's html/json artefacts diverge.
+    """
+    html_path = out_dir / "graph.html"
+    if not html_path.is_file():
+        return
+
+    nodes = graph_data.get("nodes") or []
+    json_ids = {n["id"] for n in nodes if n.get("id")}
+    if not json_ids:
+        return
+
+    html_ids = _raw_node_ids_from_html(html_path.read_text(encoding="utf-8"))
+    if json_ids <= html_ids:
+        communities = {n.get("community") for n in nodes if n.get("community") is not None}
+        _update_html_stats(
+            html_path,
+            len(json_ids),
+            len(graph_data.get("links") or []),
+            len(communities),
+        )
+        return
+
+    missing = len(json_ids - html_ids)
+    logger.info(
+        "graph.html missing %d node(s) from graph.json — regenerating visualization.",
+        missing,
+    )
+    if not _regenerate_graph_html(out_dir):
+        return
+
+    html = html_path.read_text(encoding="utf-8")
+    if 'class="resizer"' not in html:
+        html = html.replace("</body>", _RESIZER_INJECTION + "\n</body>")
+        html_path.write_text(html, encoding="utf-8")
+
+    name_map: dict[int, str] = {}
+    for node in nodes:
+        cid = node.get("community")
+        cname = node.get("community_name")
+        if cid is not None and cname and cid not in name_map:
+            name_map[int(cid)] = str(cname)
+
+    if name_map:
+        html = html_path.read_text(encoding="utf-8")
+        html = _patch_graph_html(html, name_map)
+        html_path.write_text(html, encoding="utf-8")
+
+    html_ids = _raw_node_ids_from_html(html_path.read_text(encoding="utf-8"))
+    if json_ids - html_ids:
+        logger.warning(
+            "graph.html still missing %d node(s) after cluster-only: %s",
+            len(json_ids - html_ids),
+            sorted(json_ids - html_ids)[:5],
+        )
+    else:
+        communities = {n.get("community") for n in nodes if n.get("community") is not None}
+        _update_html_stats(
+            html_path,
+            len(json_ids),
+            len(graph_data.get("links") or []),
+            len(communities),
+        )
+        logger.info("graph.html synced with graph.json (%d nodes).", len(json_ids))
+
+
 # ── Community Naming Helpers ────────────────────────────────────────────────
 
 def _compute_degrees(graph_data: dict) -> Counter:
@@ -276,23 +403,24 @@ def post_process_artifacts(out_dir: Path) -> None:
             degrees = _compute_degrees(graph_data)
             communities = _group_communities(graph_data, degrees)
 
-            if not communities:
+            if communities:
+                name_map = _generate_community_names(communities)
+                logger.info("Generated community names: %s", name_map)
+
+                _patch_graph_json(graph_data, name_map)
+                json_path.write_text(
+                    json.dumps(graph_data, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+                if html_path.is_file():
+                    html = html_path.read_text(encoding="utf-8")
+                    html = _patch_graph_html(html, name_map)
+                    html_path.write_text(html, encoding="utf-8")
+            else:
                 logger.info("No communities found in graph.json; skipping naming.")
-                return
 
-            name_map = _generate_community_names(communities)
-            logger.info("Generated community names: %s", name_map)
-
-            _patch_graph_json(graph_data, name_map)
-            json_path.write_text(
-                json.dumps(graph_data, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-
-            if html_path.is_file():
-                html = html_path.read_text(encoding="utf-8")
-                html = _patch_graph_html(html, name_map)
-                html_path.write_text(html, encoding="utf-8")
+            _ensure_html_includes_all_json_nodes(out_dir, graph_data)
 
         except json.JSONDecodeError as e:
             logger.warning("graph.json is not valid JSON: %s", e)
@@ -410,7 +538,7 @@ def run_graphify(
                 "graphify", "extract", str(filtered_dir),
                 "--backend", "ollama",
                 "--model", "llama-4-scout",
-                "--token-budget", "1500",
+                "--token-budget", _graphify_token_budget(),
             ],
             capture_output=True,
             text=True,

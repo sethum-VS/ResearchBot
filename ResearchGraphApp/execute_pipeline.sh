@@ -22,13 +22,10 @@ else
     echo "⚠️  .env not found at $ENV_FILE"
 fi
 
-# Cleanup function to close all processors on backend ports
+# Pipeline exit cleanup — VertexProxy on :8000 is intentionally left running so the
+# Swift Graph Terminal can POST /api/graph/query|path after the run completes.
 cleanup() {
-    echo "🧹 Cleaning up backend processes..."
-    # Kill process on port 8000 (VertexProxy)
-    lsof -ti :8000 | xargs kill -9 2>/dev/null || true
-    # We leave 3002 (Firecrawl) running as it is often a heavy Docker container, 
-    # but the user can add it here if they want strict cleanup.
+    echo "🧹 Pipeline finished (VertexProxy left running on :8000 for Graph Console)."
 }
 
 trap cleanup EXIT
@@ -41,14 +38,9 @@ if [ ! -d ".venv" ]; then
 fi
 source .venv/bin/activate
 
-# --- Start Vertex AI Proxy ---
-if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null ; then
-    echo "✅ VertexProxy is already running on port 8000."
-else
-    echo "🚀 Starting Vertex AI Proxy..."
-    uvicorn infrastructure.VertexProxy:app --port 8000 --log-level warning &
-    sleep 2
-fi
+# --- Start Vertex AI Proxy (persists after this script exits) ---
+"$SCRIPT_DIR/ensure_vertex_proxy.sh"
+echo "✅ VertexProxy ready on port 8000."
 
 # --- Execute Pipeline (pass all args through to main.py) ---
 python3 main.py "$@"

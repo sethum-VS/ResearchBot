@@ -27,7 +27,7 @@ from google import genai
 from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
-from infrastructure.FileStorage import get_kb_root
+from infrastructure.FileStorage import get_session_dir_from_env
 
 logger = logging.getLogger(__name__)
 
@@ -789,7 +789,15 @@ def analyze_graph_topology(
 
     Returns academic_gap_analysis payload for Swift bridging.
     """
-    path = graph_json_path or (get_kb_root() / "graphify-out" / "graph.json")
+    if graph_json_path is not None:
+        path = Path(graph_json_path)
+    else:
+        session_dir = get_session_dir_from_env()
+        if session_dir is None:
+            return _empty_analysis(
+                "graph_json_path not provided and RESEARCHBOT_SESSION_DIR is unset."
+            )
+        path = session_dir / "graphify-out" / "graph.json"
 
     if not path.is_file():
         msg = f"graph.json not found at {path}"

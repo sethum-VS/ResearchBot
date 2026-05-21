@@ -35,8 +35,8 @@ This protects Phase 4 (Graphify / Llama 4 Scout) and synthesis tasks
 which cannot reliably produce the structured JSON graph output required
 by the Swift bridging contract.
 
-Lifecycle: started by ``test_backend.sh`` before ``main.py`` runs,
-           killed on script exit via ``trap``.
+Lifecycle: started by ``execute_pipeline.sh`` / ``ensure_vertex_proxy.sh``;
+           left running after pipeline exit for Swift Graph Terminal HTTP calls.
 """
 
 import json

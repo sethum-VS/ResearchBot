@@ -170,7 +170,7 @@ All on-disk outputs below are relative to the **active session directory**:
 | **Session isolation** | Temp dir `session_dir/temp_graph_input/` with only current-run refined Markdown; artefacts land in `session_dir/graphify-out/` |
 | **Inclusion rules** | Academic refinement summary, `processed_summaries`, `# Wiki:` / `# Wikipedia:` headers, `*_URLRefiner.md`, `agent_scrapes` refinement outputs |
 | **Extraction** | Graphify CLI via `OLLAMA_BASE_URL=http://localhost:8000/v1` → VertexProxy → **Llama 4 Scout** |
-| **Token budget** | `--token-budget 1500` (micro-chunking for granular node/edge extraction) |
+| **Token budget** | `--token-budget` from `GRAPHIFY_TOKEN_BUDGET` env (default `4096`) |
 | **Post-processing** | Resizable sidebar injection in `graph.html`; Gemini 2.5 Flash community naming patched into `graph.json` + `graph.html` |
 | **Artifacts** | `session_dir/graphify-out/` only — never the legacy shared root |
 
@@ -278,23 +278,21 @@ After Phase 3, `IngestSeedUseCase` writes `session_dir/session_manifest.json`:
 ## 5. Knowledge Base Layout
 
 ```
-/research_knowledge_base/          # Sibling to Backend/ (FileStorage.get_kb_root())
-├── runs/                          # All pipeline executions (canonical, isolated)
-│   └── session_<UTC_TIMESTAMP>_<slug>/
-│       ├── agent_scrapes/         # Web, Wiki, Academic, URLRefiner, Phase 2.5 refinement
-│       ├── raw_ingestion/         # Social scraper dumps
-│       ├── processed_summaries/   # Phase 3 synthesis Markdown
-│       ├── graphify-out/          # Phase 4 artefacts (gitignored)
-│       │   ├── graph.json
-│       │   ├── graph.html
-│       │   └── GRAPH_REPORT.md
-│       ├── session_manifest.json  # HistoryView metadata
-│       └── academic_gap_analysis.json  # Persisted Phase 4.5 payload
-├── agent_scrapes/                 # Legacy shared folders (pre-session runs; optional)
-├── raw_ingestion/
-├── processed_summaries/
-└── graphify-out/
+/research_knowledge_base/          # Single KB root (sibling to Backend/)
+└── runs/                          # All pipeline executions (canonical, isolated)
+    └── session_<UTC_TIMESTAMP>_<slug>/
+        ├── agent_scrapes/         # Web, Wiki, Academic, URLRefiner, Phase 2.5 refinement
+        ├── raw_ingestion/         # Social scraper dumps
+        ├── processed_summaries/   # Phase 3 synthesis Markdown
+        ├── graphify-out/          # Phase 4 artefacts (gitignored)
+        │   ├── graph.json
+        │   ├── graph.html         # RAW_NODES must include every graph.json node id
+        │   └── GRAPH_REPORT.md
+        ├── session_manifest.json  # HistoryView metadata
+        └── academic_gap_analysis.json  # Persisted Phase 4.5 payload
 ```
+
+Stray `graphify-out/` directories outside `runs/session_*/graphify-out/` are removed by `cleanup_repo_layout.sh`.
 
 **Session allocation (`FileStorage.create_session_dir`):**
 
@@ -559,7 +557,7 @@ Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `Input
 
 ### Workspace run isolation rules
 
-1. **Session-first writes** — Every `save_markdown` and Graphify artefact must target `runs/session_<TIMESTAMP>_<slug>/`, never the legacy shared roots.
+1. **Session-first writes** — Every `save_markdown` and Graphify artefact must target `runs/session_<TIMESTAMP>_<slug>/` only. No top-level KB subfolders besides `runs/`.
 2. **Immutable session env** — `RESEARCHBOT_SESSION_DIR` is set once at `create_session_dir()` and must not be overwritten mid-run.
 3. **Corpus fidelity** — `current_run_files` must only contain paths under the active session (or in-memory equivalents before write).
 4. **Historical preservation** — Do not delete `runs/session_*` directories unless the user explicitly requests cleanup.
@@ -606,6 +604,7 @@ Optional environment variables:
 | `BRIDGE_SCRIPT_PATH` | Overrides `execute_pipeline.sh` location for Xcode schemes |
 | `RESEARCHBOT_SESSION_DIR` | Set by Python orchestrator; absolute active session path |
 | `RESEARCHBOT_KB_ROOT` | Optional override for Swift `HistoryView` KB discovery |
+| `GRAPHIFY_TOKEN_BUDGET` | Per-chunk Graphify extraction budget (default `4096`) |
 
 ---
 

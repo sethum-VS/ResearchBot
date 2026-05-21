@@ -1,27 +1,41 @@
 #!/bin/bash
+# clean_kb.sh — Clear pipeline session data under the single knowledge-base root.
+#
+# Canonical layout (only writable location):
+#   research_knowledge_base/runs/session_<timestamp>_<slug>/
+#
+# Legacy top-level folders (agent_scrapes, graphify-out, etc.) are no longer used.
 
-# clean_kb.sh — Deep clear research artifacts while preserving top-level folders
-# This script deletes everything INSIDE the subfolders of research_knowledge_base.
+set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 KB_DIR="$SCRIPT_DIR/research_knowledge_base"
+RUNS_DIR="$KB_DIR/runs"
 
-if [ -d "$KB_DIR" ]; then
-    echo "🧹 Deep cleaning subfolders in $KB_DIR..."
-    
-    # Loop through each item in the knowledge base directory
-    for subdir in "$KB_DIR"/*; do
-        if [ -d "$subdir" ]; then
-            echo "   -> Clearing $(basename "$subdir")..."
-            # Delete everything inside the subfolder (including sub-subfolders and hidden files)
-            # We use /* and /.* to catch everything, excluding . and ..
-            rm -rf "${subdir:?}"/*
-            rm -rf "${subdir:?}"/.[!.]*
-        fi
-    done
-    
-    echo "✅ Done. Knowledge base is empty but top-level folders remain."
-else
-    echo "❌ Error: Directory $KB_DIR not found."
+if [ ! -d "$KB_DIR" ]; then
+    echo "❌ Knowledge base not found: $KB_DIR"
     exit 1
 fi
+
+echo "🧹 Cleaning session workspaces in $RUNS_DIR ..."
+
+# Remove obsolete legacy shells at KB root (pre-session shared folders).
+for legacy in agent_scrapes raw_ingestion processed_summaries graphify-out; do
+    if [ -d "$KB_DIR/$legacy" ]; then
+        echo "   -> Removing legacy $legacy/"
+        rm -rf "$KB_DIR/$legacy"
+    fi
+done
+
+mkdir -p "$RUNS_DIR"
+
+if [ -d "$RUNS_DIR" ]; then
+    for session in "$RUNS_DIR"/session_*; do
+        [ -d "$session" ] || continue
+        echo "   -> Clearing $(basename "$session") ..."
+        rm -rf "${session:?}"/*
+        rm -rf "${session:?}"/.[!.]* 2>/dev/null || true
+    done
+fi
+
+echo "✅ Knowledge base cleared (runs/ preserved, legacy root folders removed)."

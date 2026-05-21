@@ -18,6 +18,10 @@ echo "========================================="
 echo "🚀 Starting ResearchBot Pipeline Setup"
 echo "========================================="
 
+if [ -x "$SCRIPT_DIR/cleanup_repo_layout.sh" ]; then
+    "$SCRIPT_DIR/cleanup_repo_layout.sh"
+fi
+
 # --- 1. GCP Auth Auto-Remedy ---
 echo "☁️  Checking Google Cloud ADC..."
 GCP_CREDS="$HOME/.config/gcloud/application_default_credentials.json"
