@@ -42,5 +42,9 @@ source .venv/bin/activate
 "$SCRIPT_DIR/ensure_vertex_proxy.sh"
 echo "✅ VertexProxy ready on port 8000."
 
-# --- Execute Pipeline (pass all args through to main.py) ---
+# --- Execute Backend (pass all args through to main.py) ---
+# Full pipeline (default):
+#   python3 main.py --idea "topic" [--url "..."]
+# Google Workspace export:
+#   python3 main.py --command export_to_workspace --session-id "session_..." --kb-root "/abs/path/research_knowledge_base"
 python3 main.py "$@"

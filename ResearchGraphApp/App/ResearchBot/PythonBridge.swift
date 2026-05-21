@@ -45,6 +45,25 @@ struct GraphConsoleResponse: Codable {
     let error: String?
 }
 
+// MARK: - Google Workspace Export Contract
+
+struct WorkspaceExportResult: Codable {
+    let status: String
+    let message: String
+    let masterDocumentURL: String?
+    let topicDocumentURL: String?
+    let topicFolderURL: String?
+    let sessionId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, message
+        case masterDocumentURL = "master_document_url"
+        case topicDocumentURL = "topic_document_url"
+        case topicFolderURL = "topic_folder_url"
+        case sessionId = "session_id"
+    }
+}
+
 @MainActor
 @Observable
 final class PythonBridge {
@@ -60,6 +79,11 @@ final class PythonBridge {
     var academicGapAnalysis: AcademicGapAnalysis?
     var sessionId: String?
     var sessionPath: String?
+
+    var isExportingWorkspace = false
+    var workspaceExportMessage: String?
+    var workspaceExportError: String?
+    var masterDocumentURL: String?
 
     /// Local FastAPI proxy that hosts the interactive graph endpoints.
     private let proxyBaseURL = URL(string: "http://localhost:8000")!
@@ -91,6 +115,40 @@ final class PythonBridge {
         guard let root = researchGraphAppRoot else { return nil }
         let path = root.appendingPathComponent("ensure_vertex_proxy.sh").path
         return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    // MARK: - Google Workspace paths (Swift checks token; Python writes it)
+
+    static var googleAppSupportDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return base.appendingPathComponent("ResearchBot", isDirectory: true)
+    }
+
+    static var googleTokenFileURL: URL {
+        googleAppSupportDirectory.appendingPathComponent("token.json")
+    }
+
+    static var hasGoogleOAuthToken: Bool {
+        FileManager.default.fileExists(atPath: googleTokenFileURL.path)
+    }
+
+    private var oauthCredentialsPath: String? {
+        if let bundled = Bundle.main.url(forResource: "credentials", withExtension: "json") {
+            return bundled.path
+        }
+        var current = URL(fileURLWithPath: Bundle.main.bundlePath)
+        for _ in 0..<10 {
+            let nested = current.appendingPathComponent("App/ResearchBot/credentials.json")
+            if FileManager.default.fileExists(atPath: nested.path) {
+                return nested.path
+            }
+            let flat = current.appendingPathComponent("credentials.json")
+            if FileManager.default.fileExists(atPath: flat.path) {
+                return flat.path
+            }
+            current = current.deletingLastPathComponent()
+        }
+        return nil
     }
 
     // MARK: - Pipeline Execution
@@ -247,6 +305,122 @@ final class PythonBridge {
             .sorted { a, b in
                 a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
             }
+    }
+
+    // MARK: - Google Workspace Export
+
+    func exportToWorkspace(sessionId: String, kbRoot: String?) {
+        guard !isExportingWorkspace else { return }
+        guard !sessionId.isEmpty else {
+            workspaceExportError = "No session selected for export."
+            return
+        }
+        guard let script = scriptPath else {
+            workspaceExportError = "Could not locate execute_pipeline.sh."
+            return
+        }
+
+        isExportingWorkspace = true
+        workspaceExportError = nil
+        workspaceExportMessage = nil
+        masterDocumentURL = nil
+
+        let credsPath = oauthCredentialsPath
+        let kb = kbRoot ?? ""
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.executeWorkspaceExport(
+                script: script,
+                sessionId: sessionId,
+                kbRoot: kb,
+                credentialsPath: credsPath
+            )
+        }
+    }
+
+    nonisolated private func executeWorkspaceExport(
+        script: String,
+        sessionId: String,
+        kbRoot: String,
+        credentialsPath: String?
+    ) async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        var args = [
+            script,
+            "--command", "export_to_workspace",
+            "--session-id", sessionId,
+        ]
+        if !kbRoot.isEmpty {
+            args += ["--kb-root", kbRoot]
+        }
+        process.arguments = args
+
+        var env = ProcessInfo.processInfo.environment
+        let homeDir = NSHomeDirectory()
+        env["PATH"] = "\(homeDir)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+        if let credentialsPath {
+            env["RESEARCHBOT_OAUTH_CREDENTIALS"] = credentialsPath
+        }
+        process.environment = env
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            await MainActor.run {
+                self.workspaceExportError = "Failed to launch export: \(error.localizedDescription)"
+                self.isExportingWorkspace = false
+            }
+            return
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+
+        await MainActor.run {
+            parseWorkspaceExportOutput(output, exitCode: process.terminationStatus)
+            isExportingWorkspace = false
+        }
+    }
+
+    private func parseWorkspaceExportOutput(_ raw: String, exitCode: Int32) {
+        let startMarker = "---WORKSPACE_EXPORT_RESULT_START---"
+        let endMarker = "---WORKSPACE_EXPORT_RESULT_END---"
+
+        guard let startRange = raw.range(of: startMarker),
+              let endRange = raw.range(of: endMarker),
+              startRange.upperBound < endRange.lowerBound else {
+            workspaceExportError = exitCode != 0
+                ? "Workspace export failed (exit \(exitCode)). Result markers not found."
+                : "Workspace export finished but no result payload was returned."
+            return
+        }
+
+        let jsonString = String(raw[startRange.upperBound..<endRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let jsonData = jsonString.data(using: .utf8) else {
+            workspaceExportError = "Failed to decode export response."
+            return
+        }
+
+        do {
+            let result = try JSONDecoder().decode(WorkspaceExportResult.self, from: jsonData)
+            if result.status == "error" {
+                workspaceExportError = result.message
+                masterDocumentURL = nil
+            } else {
+                workspaceExportError = nil
+                workspaceExportMessage = result.message
+                masterDocumentURL = result.masterDocumentURL
+            }
+        } catch {
+            workspaceExportError = "JSON decode error: \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Historical Session Loading

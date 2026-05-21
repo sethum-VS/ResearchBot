@@ -142,7 +142,7 @@ struct HistoryView: View {
                 spacing: 16
             ) {
                 ForEach(sessions) { session in
-                    HistoryCard(session: session) {
+                    HistoryCard(session: session, bridge: bridge) {
                         bridge.loadHistoricalSession(session)
                         onOpenSession(session)
                     }
@@ -290,6 +290,7 @@ struct HistoryView: View {
 
 private struct HistoryCard: View {
     let session: HistorySession
+    @Bindable var bridge: PythonBridge
     var onOpen: () -> Void
 
     var body: some View {
@@ -338,6 +339,15 @@ private struct HistoryCard: View {
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+
+            GoogleWorkspaceExportButton(
+                bridge: bridge,
+                sessionId: session.id,
+                kbRoot: session.kbRoot,
+                prominent: false
+            )
+            .font(.caption)
+            .controlSize(.small)
         }
         .padding(16)
         .frame(maxWidth: .infinity, minHeight: 160, alignment: .topLeading)

@@ -4,6 +4,8 @@
 
 ## User settings
 xcuserdata/
+credentials.json
+token.json
 
 ## Obj-C/Swift specific
 *.hmap

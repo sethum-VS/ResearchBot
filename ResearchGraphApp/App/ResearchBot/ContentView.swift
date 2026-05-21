@@ -299,6 +299,8 @@ struct GraphView: View {
                 FullDetailWindow(
                     analysis: resolvedAnalysis,
                     kbRoot: kbRoot,
+                    sessionId: bridge.sessionId,
+                    bridge: bridge,
                     onClose: { showFullAnalysis = false }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

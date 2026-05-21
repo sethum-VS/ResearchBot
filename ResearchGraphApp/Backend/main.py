@@ -27,18 +27,45 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 env_path = os.path.abspath(os.path.join(current_dir, "..", "..", ".env"))
 load_dotenv(env_path)
 
+from application.ExportWorkspaceUseCase import export_to_workspace
 from application.IngestSeedUseCase import execute
+
+WORKSPACE_START = "---WORKSPACE_EXPORT_RESULT_START---"
+WORKSPACE_END = "---WORKSPACE_EXPORT_RESULT_END---"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ResearchBot Backend Orchestrator")
+    parser.add_argument(
+        "--command",
+        type=str,
+        default="pipeline",
+        choices=("pipeline", "export_to_workspace"),
+        help="pipeline (default) or export_to_workspace",
+    )
     parser.add_argument("--idea", type=str, default="", help="Research idea or topic seed")
     parser.add_argument("--url", type=str, default="", help="Optional seed URL")
+    parser.add_argument(
+        "--session-id",
+        type=str,
+        default="",
+        help="Session directory name for export_to_workspace",
+    )
+    parser.add_argument(
+        "--kb-root",
+        type=str,
+        default="",
+        help="Absolute research_knowledge_base path for export_to_workspace",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.command == "export_to_workspace":
+        _run_workspace_export(args)
+        return
 
     try:
         result = execute(args.idea, args.url)
@@ -56,6 +83,24 @@ def main():
     # Graphify failures stay status=success with graphify.error per PROJECT_SPEC.
     if result.get("status") == "error":
         sys.exit(result.get("code", 1))
+
+
+def _run_workspace_export(args: argparse.Namespace) -> None:
+    session_id = (args.session_id or "").strip()
+    if not session_id:
+        result = {"status": "error", "message": "--session-id is required for export_to_workspace."}
+    else:
+        try:
+            result = export_to_workspace(session_id, args.kb_root or "")
+        except Exception as e:
+            result = {"status": "error", "message": f"Workspace export failed: {e}"}
+
+    print(f"\n{WORKSPACE_START}")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(WORKSPACE_END)
+
+    if result.get("status") == "error":
+        sys.exit(1)
 
 
 if __name__ == "__main__":

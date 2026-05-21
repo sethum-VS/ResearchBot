@@ -12,6 +12,8 @@ import SwiftUI
 struct FullDetailWindow: View {
     let analysis: AcademicGapAnalysis
     let kbRoot: String?
+    let sessionId: String?
+    @Bindable var bridge: PythonBridge
     var onClose: () -> Void
 
     // Pushed source under inspection (nil = list view).
@@ -65,6 +67,15 @@ struct FullDetailWindow: View {
                 .truncationMode(.middle)
 
             Spacer()
+
+            if let sid = sessionId, !sid.isEmpty {
+                GoogleWorkspaceExportButton(
+                    bridge: bridge,
+                    sessionId: sid,
+                    kbRoot: kbRoot
+                )
+                .fixedSize()
+            }
 
             Button {
                 inspectedSource = nil
