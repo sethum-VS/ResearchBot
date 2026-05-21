@@ -36,8 +36,8 @@ The workbench also provides **workspace run isolation** (every execution writes 
 ### Data Ingestion APIs
 
 * **Firecrawl** — Local Docker container for deep web crawling (`/crawl`, `/scrape`)
-* **Semantic Scholar API** — Academic citations, limitations, future work
-* **Tavily API** — Social leads (Reddit/X) and academic fallbacks
+* **Semantic Scholar API** — Keyless Academic Graph `/paper/search` (primary academic source in Phase 2)
+* **Tavily API** — Social leads (Reddit/X); secondary academic domain search (merged with S2 in `AcademicScraper.py`)
 * **MediaWiki API** — Foundational definitions and Wiki context
 
 ---
@@ -126,7 +126,7 @@ All on-disk outputs below are relative to the **active session directory**:
 |---------|--------|----------------------------------|
 | Firecrawl (sequential first) | `WebScraper.py` | `agent_scrapes/` |
 | Social (parallel) | `SocialScraper.py` | `raw_ingestion/` |
-| Academic (parallel) | `AcademicScraper.py` | `agent_scrapes/` |
+| Academic (parallel) | `AcademicScraper.py` — Semantic Scholar + Tavily, dual-subsection Markdown | `agent_scrapes/` |
 | Wiki (parallel) | `WikiAPI.py` | `agent_scrapes/` |
 
 * **Concurrency:** `ThreadPoolExecutor` with `_PHASE2_WORKERS = 3`
@@ -170,7 +170,7 @@ All on-disk outputs below are relative to the **active session directory**:
 | **Session isolation** | Temp dir `session_dir/temp_graph_input/` with only current-run refined Markdown; artefacts land in `session_dir/graphify-out/` |
 | **Inclusion rules** | Academic refinement summary, `processed_summaries`, `# Wiki:` / `# Wikipedia:` headers, `*_URLRefiner.md`, `agent_scrapes` refinement outputs |
 | **Extraction** | Graphify CLI via `OLLAMA_BASE_URL=http://localhost:8000/v1` → VertexProxy → **Llama 4 Scout** |
-| **Token budget** | `--token-budget` from `GRAPHIFY_TOKEN_BUDGET` env (default `4096`) |
+| **Token budget** | `--token-budget` from `GRAPHIFY_TOKEN_BUDGET` env (default `8192`) |
 | **Post-processing** | Resizable sidebar injection in `graph.html`; Gemini 2.5 Flash community naming patched into `graph.json` + `graph.html` |
 | **Artifacts** | `session_dir/graphify-out/` only — never the legacy shared root |
 
@@ -604,7 +604,7 @@ Optional environment variables:
 | `BRIDGE_SCRIPT_PATH` | Overrides `execute_pipeline.sh` location for Xcode schemes |
 | `RESEARCHBOT_SESSION_DIR` | Set by Python orchestrator; absolute active session path |
 | `RESEARCHBOT_KB_ROOT` | Optional override for Swift `HistoryView` KB discovery |
-| `GRAPHIFY_TOKEN_BUDGET` | Per-chunk Graphify extraction budget (default `4096`) |
+| `GRAPHIFY_TOKEN_BUDGET` | Per-chunk Graphify extraction budget (default `8192`) |
 
 ---
 

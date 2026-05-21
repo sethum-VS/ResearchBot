@@ -13,6 +13,13 @@ import json
 import os
 import sys
 
+# Line-buffer stdout so pipeline logs flush promptly when redirected to a file.
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (ValueError, OSError):
+        pass
+
 from dotenv import load_dotenv
 
 # Load .env from repo root (two levels up from Backend/)

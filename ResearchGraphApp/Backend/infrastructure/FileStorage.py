@@ -46,11 +46,30 @@ SESSION_SUBDIRS: tuple[str, ...] = (
 SESSION_DIR_ENV = "RESEARCHBOT_SESSION_DIR"
 
 
+_URLREFINER_SUFFIX = "_urlrefiner"
+
+
 def _sanitize(name: str, max_len: int = 60) -> str:
     """Turn an arbitrary topic string into a safe filename fragment."""
-    slug = re.sub(r"[^\w\s-]", "", (name or "").lower())
+    raw = name or ""
+    lower = raw.lower()
+    suffix = ""
+    base = raw
+    if _URLREFINER_SUFFIX in lower:
+        idx = lower.rfind(_URLREFINER_SUFFIX)
+        base = raw[:idx]
+        suffix = _URLREFINER_SUFFIX
+
+    slug = re.sub(r"[^\w\s-]", "", base.lower())
     slug = re.sub(r"[\s_-]+", "_", slug).strip("_")
-    return slug[:max_len] if slug else "untitled"
+    if not slug:
+        slug = "untitled"
+
+    max_base = max_len - len(suffix) if suffix else max_len
+    if max_base < 1:
+        max_base = max_len
+    slug = slug[:max_base]
+    return slug + suffix
 
 
 def _timestamp() -> str:

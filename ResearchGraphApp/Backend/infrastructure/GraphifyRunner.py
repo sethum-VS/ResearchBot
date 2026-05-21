@@ -134,7 +134,7 @@ def _graphify_env() -> dict:
 
 def _graphify_token_budget() -> str:
     """Per-chunk extraction budget (higher → more entities per source file)."""
-    return os.getenv("GRAPHIFY_TOKEN_BUDGET", "4096").strip() or "4096"
+    return os.getenv("GRAPHIFY_TOKEN_BUDGET", "8192").strip() or "8192"
 
 
 def _raw_node_ids_from_html(html: str) -> set[str]:
@@ -158,7 +158,7 @@ def _update_html_stats(html_path: Path, node_count: int, edge_count: int, commun
     )
     updated = re.sub(
         r'(<div id="stats">)(.*?)(</div>)',
-        rf"\1{stats}\3",
+        lambda m, s=stats: f"{m.group(1)}{s}{m.group(3)}",
         html,
         count=1,
         flags=re.DOTALL,
@@ -354,18 +354,18 @@ def _patch_graph_json(graph_data: dict, name_map: dict[int, str]) -> dict:
 def _patch_graph_html(html: str, name_map: dict[int, str]) -> str:
     """Patch the LEGEND array and RAW_NODES community_name values in graph.html."""
     for cid, new_name in name_map.items():
-        safe_name = json.dumps(new_name)[1:-1]
+        quoted = json.dumps(new_name)
         pattern = (
             r'("cid":\s*' + str(cid) + r',\s*"color":\s*"[^"]*",\s*"label":\s*)"[^"]*"'
         )
-        html = re.sub(pattern, r'\1"' + safe_name + '"', html)
+        html = re.sub(pattern, lambda m, q=quoted: f"{m.group(1)}{q}", html)
 
     for cid, new_name in name_map.items():
-        safe_name = json.dumps(new_name)[1:-1]
+        quoted = json.dumps(new_name)
         pattern = (
             r'("community":\s*' + str(cid) + r',\s*"community_name":\s*)"[^"]*"'
         )
-        html = re.sub(pattern, r'\1"' + safe_name + '"', html)
+        html = re.sub(pattern, lambda m, q=quoted: f"{m.group(1)}{q}", html)
 
     return html
 

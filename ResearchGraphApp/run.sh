@@ -22,6 +22,19 @@ if [ -x "$SCRIPT_DIR/cleanup_repo_layout.sh" ]; then
     "$SCRIPT_DIR/cleanup_repo_layout.sh"
 fi
 
+# --- 0. Backend Python venv (required by execute_pipeline.sh / VertexProxy) ---
+echo "🐍 Checking Backend Python environment..."
+if [ ! -d "$BACKEND_DIR/.venv" ]; then
+    echo "📦 Creating Backend/.venv and installing requirements..."
+    python3 -m venv "$BACKEND_DIR/.venv"
+    # shellcheck disable=SC1091
+    source "$BACKEND_DIR/.venv/bin/activate"
+    pip install -r "$BACKEND_DIR/requirements.txt"
+    echo "✅ Backend dependencies installed."
+else
+    echo "✅ Backend .venv found."
+fi
+
 # --- 1. GCP Auth Auto-Remedy ---
 echo "☁️  Checking Google Cloud ADC..."
 GCP_CREDS="$HOME/.config/gcloud/application_default_credentials.json"
@@ -57,10 +70,24 @@ if ! curl -s http://localhost:3002 > /dev/null; then
 
     echo "🐳 Starting Firecrawl via Docker Compose..."
     cd "$FIRECRAWL_DIR"
-    docker compose up -d
+    FIRECRAWL_UP=false
+    for attempt in 1 2; do
+        if [ "$attempt" -gt 1 ]; then
+            echo "🔄 Retrying Firecrawl bootstrap (attempt $attempt)..."
+            docker compose pull --ignore-pull-failures 2>/dev/null || true
+        fi
+        if docker compose up -d; then
+            FIRECRAWL_UP=true
+            break
+        fi
+    done
     cd "$SCRIPT_DIR"
-    echo "⏳ Waiting for Firecrawl to initialize (15s)..."
-    sleep 15
+    if [ "$FIRECRAWL_UP" = true ]; then
+        echo "⏳ Waiting for Firecrawl to initialize (15s)..."
+        sleep 15
+    else
+        echo "⚠️  Firecrawl Docker failed. App will run with degraded web scraping."
+    fi
 else
     echo "✅ Firecrawl is running at localhost:3002."
 fi
@@ -74,14 +101,14 @@ if command -v xcbeautify &> /dev/null; then
         -project "ResearchBot.xcodeproj" \
         -scheme "$SCHEME" \
         -derivedDataPath "../build" \
-        -destination 'platform=macOS' | xcbeautify
+        -destination 'platform=macOS,arch=arm64' | xcbeautify
 else
     echo "ℹ️  xcbeautify not found, using standard output..."
     xcodebuild build \
         -project "ResearchBot.xcodeproj" \
         -scheme "$SCHEME" \
         -derivedDataPath "../build" \
-        -destination 'platform=macOS'
+        -destination 'platform=macOS,arch=arm64'
 fi
 
 # --- 4. Launch App ---

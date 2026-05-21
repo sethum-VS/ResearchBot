@@ -64,13 +64,23 @@ if ! curl -s http://localhost:3002 > /dev/null; then
 
     echo "🐳 Starting Firecrawl via Docker Compose..."
     cd "$FIRECRAWL_DIR"
-    if docker compose up -d; then
+    FIRECRAWL_UP=false
+    for attempt in 1 2; do
+        if [ "$attempt" -gt 1 ]; then
+            echo "🔄 Retrying Firecrawl bootstrap (attempt $attempt)..."
+            docker compose pull --ignore-pull-failures 2>/dev/null || true
+        fi
+        if docker compose up -d; then
+            FIRECRAWL_UP=true
+            break
+        fi
+    done
+    cd "$SCRIPT_DIR"
+    if [ "$FIRECRAWL_UP" = true ]; then
         FIRECRAWL_STARTED=true
-        cd "$SCRIPT_DIR"
         echo "⏳ Waiting for Firecrawl to initialize (15s)..."
         sleep 15
     else
-        cd "$SCRIPT_DIR"
         echo "⚠️  Firecrawl Docker failed (is Docker Desktop running?). Continuing with degraded web scraping."
     fi
 else
@@ -82,9 +92,11 @@ echo "🚀 Triggering Pipeline via execute_pipeline.sh..."
 cd "$SCRIPT_DIR"
 PIPELINE_LOG="$(mktemp)"
 set +e
-./execute_pipeline.sh --idea "AI Agents for Automated Code Review" 2>&1 | tee "$PIPELINE_LOG"
-PIPELINE_EXIT=${PIPESTATUS[0]}
+# Redirect to log (avoid tee pipe hang when the shell wrapper keeps stdout open).
+./execute_pipeline.sh --idea "AI Agents for Automated Code Review" >"$PIPELINE_LOG" 2>&1
+PIPELINE_EXIT=$?
 set -e
+cat "$PIPELINE_LOG"
 
 if [ "$PIPELINE_EXIT" -ne 0 ]; then
     echo "❌ Pipeline exited with code $PIPELINE_EXIT"
@@ -194,7 +206,7 @@ print("✅ All graph.json node ids appear in graph.html RAW_NODES")
 if len(nodes) < 5:
     print(f"⚠️  graph.json has only {len(nodes)} nodes (expected richer graph from corpus)")
 
-# Count URLRefiner docs in this session only
+# Count URLRefiner docs (filename suffix or session_manifest)
 scrape_dir = session_dir / "agent_scrapes"
 urlrefiner_count = 0
 if scrape_dir.is_dir():
@@ -202,7 +214,16 @@ if scrape_dir.is_dir():
         1 for f in scrape_dir.iterdir()
         if f.suffix == ".md" and "_urlrefiner" in f.name.lower()
     )
+manifest_path = session_dir / "session_manifest.json"
+if manifest_path.is_file():
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        urlrefiner_count = max(urlrefiner_count, int(manifest.get("url_refiner_count") or 0))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
 print(f"✅ URLRefiner docs in session: {urlrefiner_count}")
+if urlrefiner_count == 0:
+    print("⚠️  No URLRefiner artefacts detected (Phase 2.6 may have skipped URLs)")
 
 graphify_err = (payload.get("graphify") or {}).get("error")
 if graphify_err:
@@ -276,7 +297,7 @@ status, result = post(
     "/api/graph/query",
     {
         "session_id": session_id,
-        "question": "List three node labels from this graph.",
+        "question": "What are the node labels in this knowledge graph?",
     },
 )
 

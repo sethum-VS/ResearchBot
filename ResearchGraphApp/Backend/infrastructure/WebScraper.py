@@ -13,25 +13,83 @@ URLs in parallel (max_workers=5) with flush=True progress streaming.
 """
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib.error
+import urllib.request
 
 from firecrawl import FirecrawlApp
 
 _CRAWL_MAX_WORKERS = 5
+_FIRECRAWL_BASE = "http://localhost:3002"
+
+
+def _firecrawl_available() -> bool:
+    """Return True when the local Firecrawl API responds on port 3002."""
+    try:
+        req = urllib.request.Request(_FIRECRAWL_BASE, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return resp.status < 500
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def _firecrawl_unavailable_message() -> str:
+    return (
+        "# Firecrawl Unavailable\n"
+        "Local Firecrawl is not running at http://localhost:3002. "
+        "Start it via Docker Compose (see test_backend.sh / PROJECT_SPEC) "
+        "or continue with Tavily, Wiki, and Semantic Scholar sources only."
+    )
 
 
 def _get_app() -> FirecrawlApp:
     """Return a Firecrawl client pointed at the local Docker instance."""
-    return FirecrawlApp(api_url='http://localhost:3002', api_key='local-dummy-key')
+    return FirecrawlApp(api_url=_FIRECRAWL_BASE, api_key="local-dummy-key")
+
+
+def _safe_iter_pages(crawl_result) -> list:
+    """Normalize Firecrawl crawl responses to a list of page objects."""
+    if crawl_result is None:
+        return []
+    data_list = getattr(crawl_result, "data", None)
+    if data_list is None and isinstance(crawl_result, dict):
+        data_list = crawl_result.get("data")
+    if data_list is None:
+        return []
+    return list(data_list)
+
+
+def _page_markdown(page) -> str:
+    md = getattr(page, "markdown", None)
+    if md is None and isinstance(page, dict):
+        md = page.get("markdown", "")
+    return md or ""
+
+
+def _page_source(page, fallback: str = "unknown") -> str:
+    meta = getattr(page, "metadata", None)
+    if meta is None and isinstance(page, dict):
+        meta = page.get("metadata") or {}
+    if meta is None:
+        return fallback
+    source = getattr(meta, "sourceURL", None) or getattr(meta, "source_url", None)
+    if source is None and isinstance(meta, dict):
+        source = meta.get("sourceURL") or meta.get("source_url")
+    return source or fallback
 
 
 # ── Single URL Scrape (existing) ─────────────────────────────────────────────
 
 def scrape_url_to_markdown(url: str) -> str:
     """Scrape a URL and return its content as Markdown using local Firecrawl."""
+    if not _firecrawl_available():
+        return _firecrawl_unavailable_message()
     try:
         app = _get_app()
-        result = app.scrape(url, formats=['markdown'])
-        return result.markdown if result.markdown else f"# No content extracted from {url}"
+        result = app.scrape(url, formats=["markdown"])
+        if result is None:
+            return f"# Scrape Error\nFirecrawl returned no response for `{url}`."
+        md = getattr(result, "markdown", None) or ""
+        return md if md else f"# No content extracted from {url}"
     except Exception as e:
         return f"# Scrape Error\nFailed to scrape `{url}` locally: {e}"
 
@@ -50,6 +108,9 @@ def firecrawl_advanced_search(
       and scrape the top results.
     - Returns concatenated Markdown from all discovered pages.
     """
+    if not _firecrawl_available():
+        return _firecrawl_unavailable_message()
+
     app = _get_app()
     sections: list[str] = []
 
@@ -59,42 +120,39 @@ def firecrawl_advanced_search(
             crawl_result = app.crawl_url(
                 target_urls[0],
                 params={
-                    'limit': 3,
-                    'scrapeOptions': {'formats': ['markdown']},
+                    "limit": 3,
+                    "scrapeOptions": {"formats": ["markdown"]},
                 },
             )
-            data_list = getattr(crawl_result, 'data', None)
-            if data_list is None and hasattr(crawl_result, 'get'):
-                data_list = crawl_result.get('data') or []
-                
-            for page in data_list:
-                md = getattr(page, 'markdown', None)
-                if md is None and hasattr(page, 'get'):
-                    md = page.get('markdown', '')
-                    
+            for page in _safe_iter_pages(crawl_result):
+                md = _page_markdown(page)
                 if md:
-                    meta = getattr(page, 'metadata', None)
-                    if meta is None and hasattr(page, 'get'):
-                        meta = page.get('metadata', {})
-                        
-                    source = getattr(meta, 'sourceURL', getattr(meta, 'source_url', 'unknown')) if meta else 'unknown'
-                    if source == 'unknown' and hasattr(meta, 'get'):
-                        source = meta.get('sourceURL', meta.get('source_url', 'unknown'))
-                        
+                    source = _page_source(page)
                     sections.append(f"<!-- source: {source} -->\n{md}")
 
         # Path B: Keyword-driven web search
         if keywords and not sections:
             search_result = app.search(
                 keywords[0],
-                scrape_options={'formats': ['markdown']},
+                scrape_options={"formats": ["markdown"]},
             )
-            for item in (getattr(search_result, 'web', None) or []):
-                md = getattr(item, 'markdown', '') or ''
-                if md:
-                    metadata = getattr(item, 'metadata', None)
-                    source = getattr(metadata, 'source_url', 'unknown') if metadata else 'unknown'
-                    sections.append(f"<!-- source: {source} -->\n{md}")
+            if search_result is None:
+                sections.append(
+                    "# Firecrawl Advanced Error\nSearch returned no response "
+                    "(is Firecrawl fully initialized?)."
+                )
+            else:
+                web_items = getattr(search_result, "web", None) or []
+                for item in web_items:
+                    md = getattr(item, "markdown", "") or ""
+                    if md:
+                        metadata = getattr(item, "metadata", None)
+                        source = (
+                            getattr(metadata, "source_url", "unknown")
+                            if metadata
+                            else "unknown"
+                        )
+                        sections.append(f"<!-- source: {source} -->\n{md}")
 
     except Exception as e:
         sections.append(f"# Firecrawl Advanced Error\n{e}")
@@ -110,10 +168,14 @@ def firecrawl_advanced_search(
 
 def _scrape_single_url(url: str) -> str | None:
     """Scrape one URL; returns Markdown or None on failure."""
+    if not _firecrawl_available():
+        return _firecrawl_unavailable_message()
     try:
         app = _get_app()
-        result = app.scrape(url, formats=['markdown'])
-        md = result.markdown
+        result = app.scrape(url, formats=["markdown"])
+        if result is None:
+            return f"# Deep Crawl Error\nFirecrawl returned no response for `{url}`."
+        md = getattr(result, "markdown", None) or ""
         if md:
             return f"<!-- source: {url} -->\n{md}"
         return None
@@ -140,10 +202,12 @@ def deep_crawl_urls(urls: list[str]) -> str:
     if not urls:
         return ""
 
+    if not _firecrawl_available():
+        return _firecrawl_unavailable_message()
+
     sections: list[str] = []
 
     if len(urls) == 1:
-        # Fast path: skip executor overhead for a single URL
         result = _scrape_single_url(urls[0])
         return result or ""
 
