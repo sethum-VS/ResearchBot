@@ -3,8 +3,8 @@
 //  ResearchBot
 //
 //  Comprehensive breakdown of the Phase 4.5 academic_gap_analysis payload.
-//  Presented as a sheet from GraphView. References render as clickable
-//  buttons that push a MarkdownViewer for source verification.
+//  Presented as a full-screen page from GraphView (not a sheet). References
+//  render as clickable buttons that push a MarkdownViewer for verification.
 //
 
 import SwiftUI
@@ -18,44 +18,74 @@ struct FullDetailWindow: View {
     @State private var inspectedSource: String?
 
     var body: some View {
-        NavigationStack {
-            ZStack {
+        VStack(spacing: 0) {
+            pageHeader
+            Divider()
+
+            Group {
                 if let filename = inspectedSource {
                     MarkdownViewer(
                         filename: filename,
                         kbRoot: kbRoot,
-                        onBack: { inspectedSource = nil }
+                        onBack: { inspectedSource = nil },
+                        showsNavigationChrome: false
                     )
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
                 } else {
                     fullAnalysisScroll
-                        .transition(.move(edge: .leading).combined(with: .opacity))
                 }
             }
-            .animation(.easeInOut(duration: 0.18), value: inspectedSource)
-            .frame(minWidth: 720, minHeight: 560)
-            .appTextSelection()
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button(role: .cancel) {
-                        onClose()
-                    } label: {
-                        Label("Close", systemImage: "xmark.circle.fill")
-                    }
-                }
-
-                ToolbarItem(placement: .principal) {
-                    Text(inspectedSource ?? "Full Gap Analysis")
-                        .font(.headline)
-                }
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.background)
+        .appTextSelection()
+        .onDisappear {
+            inspectedSource = nil
+        }
+    }
+
+    private var pageHeader: some View {
+        HStack(spacing: 12) {
+            if inspectedSource != nil {
+                Button {
+                    inspectedSource = nil
+                } label: {
+                    Label("Back", systemImage: "chevron.left")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.tint)
+            }
+
+            Image(systemName: "graduationcap.fill")
+                .foregroundStyle(.tint)
+
+            Text(inspectedSource ?? "Full Gap Analysis")
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
+            Spacer()
+
+            Button {
+                inspectedSource = nil
+                onClose()
+            } label: {
+                Label("Close", systemImage: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .keyboardShortcut(.cancelAction)
+            .help("Return to Knowledge Graph")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(.bar)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: - Main breakdown
 
     private var fullAnalysisScroll: some View {
-        ScrollView {
+        ScrollView(.vertical) {
             VStack(alignment: .leading, spacing: 28) {
                 summaryHeader
 
@@ -118,11 +148,12 @@ struct FullDetailWindow: View {
                     sourceIndex(files: files)
                 }
             }
-            .padding(28)
+            .padding(.horizontal, 32)
+            .padding(.vertical, 28)
             .frame(maxWidth: 980, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .center)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .background(.background)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var summaryHeader: some View {

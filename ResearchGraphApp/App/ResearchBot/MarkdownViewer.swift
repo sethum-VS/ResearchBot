@@ -14,6 +14,8 @@ struct MarkdownViewer: View {
     let filename: String
     let kbRoot: String?
     var onBack: () -> Void
+    /// When embedded in `FullDetailWindow`, the parent supplies navigation chrome.
+    var showsNavigationChrome: Bool = true
 
     @State private var loadState: LoadState = .loading
 
@@ -25,8 +27,10 @@ struct MarkdownViewer: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            toolbar
-            Divider()
+            if showsNavigationChrome {
+                toolbar
+                Divider()
+            }
             content
         }
         .background(.background)

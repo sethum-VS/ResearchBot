@@ -294,6 +294,34 @@ struct GraphView: View {
     }
 
     var body: some View {
+        Group {
+            if showFullAnalysis {
+                FullDetailWindow(
+                    analysis: resolvedAnalysis,
+                    kbRoot: kbRoot,
+                    onClose: { showFullAnalysis = false }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .appTextSelection()
+            } else {
+                graphWorkspace
+                    .appTextSelection()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .sheet(item: $openBrowser) { folder in
+            DocumentBrowserView(
+                title: folder.title,
+                files: bridge.listMarkdownFiles(in: folder.subfolder),
+                kbRoot: kbRoot,
+                sessionPath: bridge.sessionPath,
+                onClose: { openBrowser = nil }
+            )
+            .appTextSelection()
+        }
+    }
+
+    private var graphWorkspace: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Button {
@@ -314,9 +342,7 @@ struct GraphView: View {
                 dataSourcesMenu
 
                 Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showTerminal.toggle()
-                    }
+                    showTerminal.toggle()
                 } label: {
                     Label("Console", systemImage: showTerminal ? "terminal.fill" : "terminal")
                 }
@@ -342,47 +368,35 @@ struct GraphView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .appTextSelection()
-        .sheet(isPresented: $showFullAnalysis) {
-            FullDetailWindow(
-                analysis: resolvedAnalysis,
-                kbRoot: kbRoot,
-                onClose: { showFullAnalysis = false }
-            )
-            .appTextSelection()
-        }
-        .sheet(item: $openBrowser) { folder in
-            DocumentBrowserView(
-                title: folder.title,
-                files: bridge.listMarkdownFiles(in: folder.subfolder),
-                kbRoot: kbRoot,
-                sessionPath: bridge.sessionPath,
-                onClose: { openBrowser = nil }
-            )
-            .appTextSelection()
-        }
     }
 
-    // MARK: - Resizable graph + console split
+    // MARK: - Graph + console (stable hierarchy — never swap VSplitView ↔ single web view)
 
-    @ViewBuilder
     private var graphAndConsole: some View {
-        if showTerminal {
-            VSplitView {
-                GraphWebView(filePath: graphPath)
-                    .frame(minHeight: 300)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .layoutPriority(1)
-
-                GraphTerminalView(bridge: bridge)
-                    .frame(minHeight: 150, idealHeight: 200)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else {
+        VSplitView {
             GraphWebView(filePath: graphPath)
+                .frame(minHeight: 200)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+
+            Group {
+                if showTerminal {
+                    GraphTerminalView(bridge: bridge)
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(
+                minHeight: showTerminal ? 150 : 0,
+                idealHeight: showTerminal ? 200 : 0,
+                maxHeight: showTerminal ? .infinity : 0
+            )
+            .frame(maxWidth: .infinity)
+            .clipped()
+            .allowsHitTesting(showTerminal)
+            .accessibilityHidden(!showTerminal)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     // MARK: - Data Sources menu
@@ -438,6 +452,33 @@ enum DataSourceFolder: Identifiable {
 
 // MARK: - WKWebView Wrapper
 
+/// Host view keeps WKWebView pinned to bounds — prevents blank/white glitches after split toggles.
+final class GraphWebViewHost: NSView {
+    let webView: WKWebView
+
+    init(webView: WKWebView) {
+        self.webView = webView
+        super.init(frame: .zero)
+        wantsLayer = true
+        addSubview(webView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        webView.frame = bounds
+    }
+
+    override func resizeSubviews(withOldSize oldSize: NSSize) {
+        super.resizeSubviews(withOldSize: oldSize)
+        webView.frame = bounds
+    }
+}
+
 struct GraphWebView: NSViewRepresentable {
     let filePath: String
 
@@ -445,15 +486,20 @@ struct GraphWebView: NSViewRepresentable {
         Coordinator()
     }
 
-    func makeNSView(context: Context) -> WKWebView {
+    func makeNSView(context: Context) -> GraphWebViewHost {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.navigationDelegate = context.coordinator
-        return webView
+        context.coordinator.webView = webView
+        return GraphWebViewHost(webView: webView)
     }
 
-    func updateNSView(_ webView: WKWebView, context: Context) {
+    func updateNSView(_ host: GraphWebViewHost, context: Context) {
+        let webView = host.webView
+        host.needsLayout = true
+        host.layoutSubtreeIfNeeded()
+
         guard context.coordinator.lastLoadedPath != filePath else { return }
         context.coordinator.lastLoadedPath = filePath
         let fileURL = URL(fileURLWithPath: filePath)
@@ -463,6 +509,7 @@ struct GraphWebView: NSViewRepresentable {
 
     /// Re-enables text selection in PyVis HTML (often ships with user-select disabled).
     final class Coordinator: NSObject, WKNavigationDelegate {
+        weak var webView: WKWebView?
         var lastLoadedPath: String?
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -474,6 +521,7 @@ struct GraphWebView: NSViewRepresentable {
             })();
             """
             webView.evaluateJavaScript(script, completionHandler: nil)
+            webView.setNeedsDisplay(webView.bounds)
         }
     }
 }

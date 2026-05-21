@@ -3,7 +3,7 @@
 //  ResearchBot
 //
 //  Concise summary panel alongside the WKWebView. Surfaces the executive
-//  summary + gap counts only; the deep breakdown lives in FullDetailWindow.
+//  summary + gap counts only; the deep breakdown lives in the full-screen FullDetailWindow page.
 //
 
 import SwiftUI
