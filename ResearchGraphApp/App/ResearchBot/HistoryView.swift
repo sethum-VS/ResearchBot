@@ -62,6 +62,7 @@ struct HistoryView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 560)
+        .appTextSelection()
         .onAppear { reloadSessions() }
     }
 
@@ -292,63 +293,62 @@ private struct HistoryCard: View {
     var onOpen: () -> Void
 
     var body: some View {
-        Button(action: onOpen) {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
-                    Image(systemName: session.hasGraph ? "point.3.connected.trianglepath.dotted" : "doc.text.magnifyingglass")
-                        .font(.title3)
-                        .foregroundStyle(session.hasGraph ? Color.accentColor : .secondary)
-                    Text(session.formattedDate)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if !session.hasGraph {
-                        Text("NO GRAPH")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.orange)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(.orange.opacity(0.15))
-                            .clipShape(Capsule())
-                    }
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: session.hasGraph ? "point.3.connected.trianglepath.dotted" : "doc.text.magnifyingglass")
+                    .font(.title3)
+                    .foregroundStyle(session.hasGraph ? Color.accentColor : .secondary)
+                Text(session.formattedDate)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !session.hasGraph {
+                    Text("NO GRAPH")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.orange.opacity(0.15))
+                        .clipShape(Capsule())
                 }
-
-                Text(session.topic)
-                    .font(.headline)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                Spacer(minLength: 4)
-
-                HStack(spacing: 12) {
-                    metricChip(
-                        icon: "link",
-                        value: "\(session.urlRefinerCount)",
-                        label: "URLRefiners"
-                    )
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.tertiary)
-                }
-
-                Text(session.id)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
             }
-            .padding(16)
-            .frame(maxWidth: .infinity, minHeight: 160, alignment: .topLeading)
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 14))
-            .overlay(
-                RoundedRectangle(cornerRadius: 14)
-                    .strokeBorder(.quaternary, lineWidth: 1)
-            )
+
+            Text(session.topic)
+                .font(.headline)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            Spacer(minLength: 4)
+
+            HStack(spacing: 12) {
+                metricChip(
+                    icon: "link",
+                    value: "\(session.urlRefinerCount)",
+                    label: "URLRefiners"
+                )
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.tertiary)
+            }
+
+            Text(session.id)
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
-        .buttonStyle(.plain)
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: 160, alignment: .topLeading)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(.quaternary, lineWidth: 1)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onOpen)
     }
 
     private func metricChip(icon: String, value: String, label: String) -> some View {

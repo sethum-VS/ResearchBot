@@ -59,6 +59,7 @@ struct GraphTerminalView: View {
         .padding(14)
         .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
+        .appTextSelection()
     }
 
     // MARK: - Header
@@ -143,7 +144,6 @@ struct GraphTerminalView: View {
             Text(entry.output)
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(entry.isError ? .red : .green.opacity(0.92))
-                .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }

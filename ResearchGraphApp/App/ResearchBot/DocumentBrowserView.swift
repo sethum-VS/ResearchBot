@@ -51,6 +51,7 @@ struct DocumentBrowserView: View {
             }
             .animation(.easeInOut(duration: 0.18), value: selectedFile)
             .frame(minWidth: 720, minHeight: 520)
+            .appTextSelection()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(role: .cancel) {
@@ -86,10 +87,7 @@ struct DocumentBrowserView: View {
         } else {
             List(files, id: \.self, selection: $selectedFile) { file in
                 FileRow(url: file)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        selectedFile = file
-                    }
+                    .tag(file)
                     .contextMenu {
                         Button {
                             selectedFile = file

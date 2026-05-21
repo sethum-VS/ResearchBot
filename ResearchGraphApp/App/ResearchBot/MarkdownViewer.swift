@@ -30,6 +30,7 @@ struct MarkdownViewer: View {
             content
         }
         .background(.background)
+        .appTextSelection()
         .task(id: filename) {
             await load()
         }
@@ -116,7 +117,6 @@ struct MarkdownViewer: View {
                 .frame(maxWidth: 820, alignment: .leading)
                 .frame(maxWidth: .infinity, alignment: .center)
             }
-            .textSelection(.enabled)
         }
     }
 
@@ -275,57 +275,60 @@ private struct MarkdownBlockView: View {
     let block: MarkdownBlock
 
     var body: some View {
-        switch block.kind {
-        case .heading(let level):
-            Text(block.text)
-                .font(headingFont(for: level))
-                .fontWeight(.semibold)
-                .padding(.top, level <= 2 ? 8 : 4)
-                .padding(.bottom, 2)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        Group {
+            switch block.kind {
+            case .heading(let level):
+                Text(block.text)
+                    .font(headingFont(for: level))
+                    .fontWeight(.semibold)
+                    .padding(.top, level <= 2 ? 8 : 4)
+                    .padding(.bottom, 2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-        case .paragraph:
-            Text(attributed(block.text))
-                .font(.body)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-        case .bullet:
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text("•")
-                    .foregroundStyle(.secondary)
+            case .paragraph:
                 Text(attributed(block.text))
                     .font(.body)
                     .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
-        case .codeBlock:
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(block.text)
-                    .font(.system(.callout, design: .monospaced))
-                    .padding(12)
-                    .frame(minWidth: 0, alignment: .leading)
-            }
-            .background(.quaternary.opacity(0.4))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            case .bullet:
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("•")
+                        .foregroundStyle(.secondary)
+                    Text(attributed(block.text))
+                        .font(.body)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-        case .quote:
-            HStack(spacing: 10) {
-                Rectangle()
-                    .fill(.tint)
-                    .frame(width: 3)
-                Text(attributed(block.text))
-                    .font(.body.italic())
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            case .codeBlock:
+                ScrollView(.horizontal, showsIndicators: false) {
+                    Text(block.text)
+                        .font(.system(.callout, design: .monospaced))
+                        .padding(12)
+                        .frame(minWidth: 0, alignment: .leading)
+                }
+                .background(.quaternary.opacity(0.4))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
 
-        case .rule:
-            Divider()
-                .padding(.vertical, 6)
+            case .quote:
+                HStack(spacing: 10) {
+                    Rectangle()
+                        .fill(.tint)
+                        .frame(width: 3)
+                    Text(attributed(block.text))
+                        .font(.body.italic())
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            case .rule:
+                Divider()
+                    .padding(.vertical, 6)
+            }
         }
+        .textSelection(.enabled)
     }
 
     private func headingFont(for level: Int) -> Font {

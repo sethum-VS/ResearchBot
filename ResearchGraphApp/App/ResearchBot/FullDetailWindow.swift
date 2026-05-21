@@ -34,6 +34,7 @@ struct FullDetailWindow: View {
             }
             .animation(.easeInOut(duration: 0.18), value: inspectedSource)
             .frame(minWidth: 720, minHeight: 560)
+            .appTextSelection()
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(role: .cancel) {

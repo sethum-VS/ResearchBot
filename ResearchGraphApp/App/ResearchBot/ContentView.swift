@@ -90,6 +90,7 @@ struct InputView: View {
             inputFormFooter
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .appTextSelection()
         .onChange(of: bridge.graphFilePath) { _, newPath in
             if newPath != nil && bridge.errorMessage == nil {
                 onGraphReady()
@@ -175,7 +176,6 @@ struct InputView: View {
                         : .primary
                 )
                 .frame(maxWidth: .infinity, minHeight: 120, alignment: .topLeading)
-                .textSelection(.enabled)
                 .padding(10)
                 .background(.ultraThinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -342,12 +342,14 @@ struct GraphView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .appTextSelection()
         .sheet(isPresented: $showFullAnalysis) {
             FullDetailWindow(
                 analysis: resolvedAnalysis,
                 kbRoot: kbRoot,
                 onClose: { showFullAnalysis = false }
             )
+            .appTextSelection()
         }
         .sheet(item: $openBrowser) { folder in
             DocumentBrowserView(
@@ -357,6 +359,7 @@ struct GraphView: View {
                 sessionPath: bridge.sessionPath,
                 onClose: { openBrowser = nil }
             )
+            .appTextSelection()
         }
     }
 
@@ -438,17 +441,40 @@ enum DataSourceFolder: Identifiable {
 struct GraphWebView: NSViewRepresentable {
     let filePath: String
 
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
     func makeNSView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
         let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
         return webView
     }
 
     func updateNSView(_ webView: WKWebView, context: Context) {
+        guard context.coordinator.lastLoadedPath != filePath else { return }
+        context.coordinator.lastLoadedPath = filePath
         let fileURL = URL(fileURLWithPath: filePath)
         let directory = fileURL.deletingLastPathComponent()
         webView.loadFileURL(fileURL, allowingReadAccessTo: directory)
+    }
+
+    /// Re-enables text selection in PyVis HTML (often ships with user-select disabled).
+    final class Coordinator: NSObject, WKNavigationDelegate {
+        var lastLoadedPath: String?
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            let script = """
+            (function() {
+              var style = document.createElement('style');
+              style.textContent = '* { -webkit-user-select: text !important; user-select: text !important; }';
+              document.head.appendChild(style);
+            })();
+            """
+            webView.evaluateJavaScript(script, completionHandler: nil)
+        }
     }
 }
 

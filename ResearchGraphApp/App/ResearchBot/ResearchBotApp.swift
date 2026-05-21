@@ -12,6 +12,16 @@ struct ResearchBotApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .appTextSelection()
         }
+    }
+}
+
+// MARK: - App-wide text selection
+
+extension View {
+    /// Enables standard macOS copy/select for all `Text` in this view hierarchy.
+    func appTextSelection() -> some View {
+        textSelection(.enabled)
     }
 }

@@ -160,6 +160,7 @@ struct GapAnalysisPanel: View {
         }
         .frame(minWidth: isCollapsed ? 44 : 280, idealWidth: 320, maxWidth: 420)
         .background(.regularMaterial)
+        .appTextSelection()
     }
 
     // MARK: Subviews
