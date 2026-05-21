@@ -192,6 +192,51 @@ final class PythonBridge {
         }
     }
 
+    // MARK: - Run-Scoped File Discovery
+
+    /// List `.md` files inside a sub-folder of the currently active run.
+    ///
+    /// Resolves against `sessionPath` (preferred — every run is isolated under
+    /// `runs/session_<TIMESTAMP>_<slug>/`) and falls back to `kbRoot` only if
+    /// no session has been loaded yet. Returns an empty array when the
+    /// sub-folder doesn't exist or no run is active. Results are sorted by
+    /// filename (case-insensitive) for stable UI ordering.
+    func listMarkdownFiles(in subfolder: String) -> [URL] {
+        let base = sessionPath ?? kbRoot
+        guard let base, !base.isEmpty else { return [] }
+        return PythonBridge.listMarkdownFiles(in: subfolder, under: base)
+    }
+
+    /// Pure helper — scans `<root>/<subfolder>` and returns its `.md` files.
+    /// Kept `static` so SwiftUI views and detached tasks can call it without
+    /// touching the observable state.
+    static func listMarkdownFiles(in subfolder: String, under root: String) -> [URL] {
+        let folder = URL(fileURLWithPath: root).appendingPathComponent(subfolder)
+        let fm = FileManager.default
+
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: folder.path, isDirectory: &isDir), isDir.boolValue else {
+            return []
+        }
+
+        let entries: [URL]
+        do {
+            entries = try fm.contentsOfDirectory(
+                at: folder,
+                includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            )
+        } catch {
+            return []
+        }
+
+        return entries
+            .filter { $0.pathExtension.lowercased() == "md" }
+            .sorted { a, b in
+                a.lastPathComponent.localizedCaseInsensitiveCompare(b.lastPathComponent) == .orderedAscending
+            }
+    }
+
     // MARK: - Historical Session Loading
 
     /// Load a previously-recorded session into the live observable state.

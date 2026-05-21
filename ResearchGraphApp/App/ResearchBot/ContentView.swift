@@ -64,6 +64,7 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 820, minHeight: 600)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
 
@@ -79,64 +80,16 @@ struct InputView: View {
     @State private var hasError = false
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
             headerBar
 
-            VStack(spacing: 24) {
-                VStack(alignment: .leading, spacing: 12) {
-                    Text("What do you want to research?")
-                        .font(.title3.weight(.semibold))
-                        .foregroundStyle(.primary)
+            pipelineOutputPane
 
-                    TextEditor(text: $idea)
-                        .font(.body)
-                        .scrollContentBackground(.hidden)
-                        .padding(12)
-                        .frame(minHeight: 100, maxHeight: 140)
-                        .background(.ultraThinMaterial)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 12)
-                                .strokeBorder(.quaternary, lineWidth: 1)
-                        )
+            Divider()
 
-                    TextField("Optional reference URL (https://…)", text: $referenceURL)
-                        .textFieldStyle(.roundedBorder)
-
-                    Text("Paste a topic or question. Add an optional URL for Firecrawl and seed analysis.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Button {
-                    bridge.runPipeline(idea: idea, url: referenceURL)
-                } label: {
-                    HStack(spacing: 8) {
-                        if bridge.isRunning {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Researching…")
-                        } else {
-                            Image(systemName: "sparkle.magnifyingglass")
-                            Text("Run Research")
-                        }
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.accentColor)
-                .controlSize(.large)
-                .disabled(bridge.isRunning || idea.trimmingCharacters(in: .whitespaces).isEmpty)
-
-                if bridge.isRunning || !bridge.progress.isEmpty {
-                    outputConsole
-                }
-            }
-            .padding(24)
-
-            Spacer()
+            inputFormFooter
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onChange(of: bridge.graphFilePath) { _, newPath in
             if newPath != nil && bridge.errorMessage == nil {
                 onGraphReady()
@@ -152,34 +105,57 @@ struct InputView: View {
         }
     }
 
+    /// Top toolbar — Archive pinned top-leading; title centered in the bar.
     private var headerBar: some View {
-        HStack(spacing: 10) {
-            Button {
-                onBackToHistory()
-            } label: {
-                Label("Archive", systemImage: "chevron.left")
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(.tint)
-
-            Spacer()
-
-            Image(systemName: "atom")
-                .font(.title2)
+        ZStack {
+            HStack {
+                Button {
+                    onBackToHistory()
+                } label: {
+                    Label("Archive", systemImage: "chevron.left")
+                }
+                .buttonStyle(.plain)
                 .foregroundStyle(.tint)
-            Text("Research Graph")
-                .font(.title2.weight(.bold))
 
-            Spacer()
+                Spacer(minLength: 0)
+            }
 
-            Color.clear.frame(width: 70)
+            HStack(spacing: 8) {
+                Image(systemName: "atom")
+                    .font(.title2)
+                    .foregroundStyle(.tint)
+                Text("Research Graph")
+                    .font(.title2.weight(.bold))
+            }
         }
         .padding(.horizontal, 24)
-        .padding(.vertical, 16)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .background(.bar)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
-    private var outputConsole: some View {
+    /// Middle pane — always visible; streams agent / pipeline stdout while running.
+    private var pipelineOutputPane: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                pipelineOutputSection
+                    .id("pipeline-output")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 16)
+            }
+            .frame(maxWidth: .infinity, minHeight: 160, maxHeight: .infinity, alignment: .top)
+            .onChange(of: bridge.progress) { _, _ in
+                withAnimation(.easeOut(duration: 0.15)) {
+                    proxy.scrollTo("pipeline-output", anchor: .bottom)
+                }
+            }
+        }
+    }
+
+    /// Expanding central pane — live pipeline logs scroll here.
+    private var pipelineOutputSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Pipeline Output")
@@ -191,25 +167,92 @@ struct InputView: View {
                 }
             }
 
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(bridge.progress)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(10)
-                        .id("bottom")
-                }
-                .frame(maxHeight: 200)
+            Text(pipelineOutputDisplayText)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(
+                    bridge.progress.isEmpty && !bridge.isRunning
+                        ? .secondary
+                        : .primary
+                )
+                .frame(maxWidth: .infinity, minHeight: 120, alignment: .topLeading)
+                .textSelection(.enabled)
+                .padding(10)
                 .background(.ultraThinMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 10))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10)
                         .strokeBorder(.quaternary, lineWidth: 1)
                 )
-                .onChange(of: bridge.progress) { _, _ in
-                    proxy.scrollTo("bottom", anchor: .bottom)
-                }
+        }
+    }
+
+    private var pipelineOutputDisplayText: String {
+        if bridge.progress.isEmpty && !bridge.isRunning {
+            return "Agent progress will stream here when you run research…"
+        }
+        return bridge.progress
+    }
+
+    /// Input form docked at the bottom with safe padding above the window edge.
+    private var inputFormFooter: some View {
+        inputFormContent
+            .frame(maxWidth: 720)
+            .frame(maxWidth: .infinity)
+            .padding(.horizontal, 24)
+            .padding(.top, 20)
+            .padding(.bottom, 40)
+            .background(.bar)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Core input controls — padding applied by `inputFormFooter`.
+    private var inputFormContent: some View {
+        VStack(spacing: 24) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("What do you want to research?")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.primary)
+
+                TextEditor(text: $idea)
+                    .font(.body)
+                    .scrollContentBackground(.hidden)
+                    .frame(minHeight: 120, maxHeight: 160)
+                    .padding(12)
+                    .background(.ultraThinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .strokeBorder(.quaternary, lineWidth: 1)
+                    )
+
+                TextField("Optional reference URL (https://…)", text: $referenceURL)
+                    .textFieldStyle(.roundedBorder)
+
+                Text("Paste a topic or question. Add an optional URL for Firecrawl and seed analysis.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
+
+            Button {
+                bridge.runPipeline(idea: idea, url: referenceURL)
+            } label: {
+                HStack(spacing: 8) {
+                    if bridge.isRunning {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Researching…")
+                    } else {
+                        Image(systemName: "sparkle.magnifyingglass")
+                        Text("Run Research")
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.accentColor)
+            .controlSize(.large)
+            .disabled(bridge.isRunning || idea.trimmingCharacters(in: .whitespaces).isEmpty)
         }
     }
 }
@@ -227,6 +270,9 @@ struct GraphView: View {
     @State private var showFullAnalysis = false
     @State private var showTerminal = true
 
+    /// Active data-source browser (nil = none open).
+    @State private var openBrowser: DataSourceFolder?
+
     private var placeholderAnalysis: AcademicGapAnalysis {
         AcademicGapAnalysis(
             summary: "Gap analysis will appear here after the pipeline completes Phase 4.5.",
@@ -242,9 +288,14 @@ struct GraphView: View {
         gapAnalysis ?? placeholderAnalysis
     }
 
+    /// Run is "live" once Python has emitted a session path with a graph.
+    private var hasActiveRun: Bool {
+        bridge.sessionPath?.isEmpty == false
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 10) {
                 Button {
                     onBack()
                 } label: {
@@ -259,6 +310,8 @@ struct GraphView: View {
                     .font(.headline)
 
                 Spacer()
+
+                dataSourcesMenu
 
                 Button {
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -277,18 +330,9 @@ struct GraphView: View {
             Divider()
 
             HSplitView {
-                VStack(spacing: 0) {
-                    GraphWebView(filePath: graphPath)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                    if showTerminal {
-                        Divider()
-                        GraphTerminalView(bridge: bridge)
-                            .frame(height: 360)
-                    }
-                }
-                .frame(minWidth: 400)
-                .layoutPriority(1)
+                graphAndConsole
+                    .frame(minWidth: 360)
+                    .layoutPriority(1)
 
                 GapAnalysisPanel(
                     analysis: resolvedAnalysis,
@@ -304,6 +348,87 @@ struct GraphView: View {
                 kbRoot: kbRoot,
                 onClose: { showFullAnalysis = false }
             )
+        }
+        .sheet(item: $openBrowser) { folder in
+            DocumentBrowserView(
+                title: folder.title,
+                files: bridge.listMarkdownFiles(in: folder.subfolder),
+                kbRoot: kbRoot,
+                sessionPath: bridge.sessionPath,
+                onClose: { openBrowser = nil }
+            )
+        }
+    }
+
+    // MARK: - Resizable graph + console split
+
+    @ViewBuilder
+    private var graphAndConsole: some View {
+        if showTerminal {
+            VSplitView {
+                GraphWebView(filePath: graphPath)
+                    .frame(minHeight: 300)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .layoutPriority(1)
+
+                GraphTerminalView(bridge: bridge)
+                    .frame(minHeight: 150, idealHeight: 200)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            GraphWebView(filePath: graphPath)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    // MARK: - Data Sources menu
+
+    private var dataSourcesMenu: some View {
+        Menu {
+            Button {
+                openBrowser = .agentScrapes
+            } label: {
+                Label("View Academic Sources", systemImage: "doc.text.magnifyingglass")
+            }
+            .disabled(!hasActiveRun)
+
+            Button {
+                openBrowser = .processedSummaries
+            } label: {
+                Label("View Processed Summaries", systemImage: "text.book.closed")
+            }
+            .disabled(!hasActiveRun)
+        } label: {
+            Label("Data Sources", systemImage: "tray.full")
+        }
+        .menuStyle(.borderedButton)
+        .disabled(!hasActiveRun)
+        .help(hasActiveRun
+              ? "Browse the raw Markdown corpus that fed this run"
+              : "Open or run a session to browse its raw documents")
+    }
+}
+
+// MARK: - Data Source folder mapping
+
+enum DataSourceFolder: Identifiable {
+    case agentScrapes
+    case processedSummaries
+
+    var id: String { subfolder }
+
+    var subfolder: String {
+        switch self {
+        case .agentScrapes:       return "agent_scrapes"
+        case .processedSummaries: return "processed_summaries"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .agentScrapes:       return "Refined Academic Sources"
+        case .processedSummaries: return "Processed Summaries"
         }
     }
 }

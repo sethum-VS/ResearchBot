@@ -33,6 +33,8 @@ struct GraphTerminalView: View {
             header
 
             transcriptView
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
 
             Divider()
 
@@ -51,10 +53,11 @@ struct GraphTerminalView: View {
                     .font(.caption)
                     .foregroundStyle(.red)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(14)
-        .frame(minWidth: 320)
+        .frame(minWidth: 320, maxWidth: .infinity, maxHeight: .infinity)
         .background(.background)
     }
 
@@ -86,7 +89,7 @@ struct GraphTerminalView: View {
 
     private var transcriptView: some View {
         ScrollViewReader { proxy in
-            ScrollView {
+            ScrollView(.vertical, showsIndicators: true) {
                 LazyVStack(alignment: .leading, spacing: 10) {
                     if transcript.isEmpty {
                         emptyTranscript
@@ -100,9 +103,9 @@ struct GraphTerminalView: View {
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.black.opacity(0.85))
             .clipShape(RoundedRectangle(cornerRadius: 10))
-            .frame(minHeight: 220, idealHeight: 320)
             .onChange(of: transcript.count) { _, _ in
                 if let last = transcript.last?.id {
                     withAnimation(.easeOut(duration: 0.2)) {
@@ -141,8 +144,10 @@ struct GraphTerminalView: View {
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(entry.isError ? .red : .green.opacity(0.92))
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     // MARK: - Macro Buttons
