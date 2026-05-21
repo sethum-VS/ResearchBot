@@ -12,6 +12,8 @@ and surfaces **actionable FYP angles** with **source-verifiable citations** back
 
 Simply rendering a knowledge graph is not sufficient. Phase **4.5 (Academic Graph Analyzer)** actively guides students on *how* to read graph topology—structural holes, validated limitation nodes, and orphaned solutions—grounded in the full source text of the current pipeline run.
 
+The workbench also provides **workspace run isolation** (every execution writes to a dedicated timestamped folder) and an **interactive Graph Explorer Console** (`graphify query` / `graphify path`) for live topology interrogation against any historical session.
+
 ---
 
 ## 2. Technology Stack & Environment
@@ -19,15 +21,15 @@ Simply rendering a knowledge graph is not sufficient. Phase **4.5 (Academic Grap
 | Layer | Technology |
 |-------|------------|
 | **Platform** | macOS (optimized for Apple Silicon) |
-| **Frontend** | SwiftUI (`@Observable`), `WKWebView` (Graphify HTML), native Markdown viewer |
+| **Frontend** | SwiftUI (`@Observable`), `WKWebView` (Graphify HTML), native Markdown viewer, `URLSession` → VertexProxy graph APIs |
 | **Backend** | Python 3.10+, subprocess bridge via `execute_pipeline.sh` → `main.py` |
-| **Local proxy** | `VertexProxy.py` (FastAPI on port 8000) — OpenAI-compatible bridge to Vertex AI for Graphify / Llama 4 Scout |
+| **Local proxy** | `VertexProxy.py` (FastAPI on port 8000) — OpenAI-compatible bridge to Vertex AI; hosts `/api/graph/*` interactive endpoints |
 
 ### AI Models
 
 | Model | Role |
 |-------|------|
-| **Gemini 2.5 Flash** | Phase 1.5 input analysis; Phase 2.6 high-value URL extraction |
+| **Gemini 2.5 Flash** | Phase 1.5 input analysis; Phase 2.6 high-value URL extraction; post-Graphify community naming |
 | **Gemini 2.5 Pro** | Phase 2.5 noise refinement; Phase 3 synthesis; **Phase 4.5 Map-Reduce gap analysis** (3 parallel category calls + executive summary) |
 | **Llama 4 Scout** | Phase 4 knowledge-graph extraction (10M context via VertexProxy) |
 
@@ -42,54 +44,72 @@ Simply rendering a knowledge graph is not sufficient. Phase **4.5 (Academic Grap
 
 ## 3. Core Architecture & Data Flow
 
-The system operates as a recursive, concurrent pipeline with **strict session isolation**. Each run builds an in-memory `current_run_files` queue (absolute `Path` objects) that feeds Phase 4 Graphify and Phase 4.5 analysis—never mixing artifacts from prior runs.
+The system operates as a recursive, concurrent pipeline with **strict session isolation**. Each run:
+
+1. Allocates a dedicated directory under `research_knowledge_base/runs/session_<TIMESTAMP>_<slug>/`
+2. Pins that absolute path in `RESEARCHBOT_SESSION_DIR` for the lifetime of the process
+3. Builds an in-memory `current_run_files` queue (absolute `Path` objects) that feeds Phase 4 Graphify and Phase 4.5 analysis—never mixing artifacts from prior runs
 
 ```mermaid
 graph TD
-    A[SwiftUI App] -->|Process: execute_pipeline.sh| B[main.py → IngestSeedUseCase.py]
+    A[SwiftUI App] -->|HistoryView| H[runs/session_* archive]
+    A -->|Process: execute_pipeline.sh| B[main.py → IngestSeedUseCase.py]
+    B -->|create_session_dir| S[runs/session_TIMESTAMP_slug/]
 
     B -->|Phase 1.5| C[InputAnalyzer.py]
     C --> D[Gemini 2.5 Flash]
 
     B -->|Phase 2 parallel| E[Social + Academic + Wiki Scrapers]
-    E --> F[agent_scrapes / raw_ingestion .md]
+    E --> F[session/agent_scrapes + raw_ingestion]
 
     B -->|Phase 2.5| G[DataRefiner.py]
-    G --> H[Gemini 2.5 Pro]
+    G --> H2[Gemini 2.5 Pro]
 
     B -->|Phase 2.6 concurrent| I[Firecrawl + per-URL DataRefiner]
     I --> J[_URLRefiner.md → current_run_files]
 
     B -->|Phase 3| K[AgentSynthesizer.py]
-    K --> L[Gemini 2.5 Pro → processed_summaries]
+    K --> L[session/processed_summaries]
 
     B -->|Phase 4| M[GraphifyRunner.py]
     M -->|token-budget 1500| N[Llama 4 Scout via VertexProxy :8000]
-    N --> O[graphify-out: graph.json / graph.html]
+    N --> O[session/graphify-out: graph.json / graph.html]
 
     B -->|Phase 4.5 Map-Reduce| P[GraphAnalyzer.py]
-    P -->|3 parallel + summary| Q[Gemini 2.5 Pro × regions]
-    Q --> R[academic_gap_analysis JSON]
+    P --> Q[academic_gap_analysis JSON + session/academic_gap_analysis.json]
 
-    O --> S[GraphView: WKWebView]
-    R --> T[GapAnalysisPanel + FullDetailWindow]
+    O --> V[GraphView: WKWebView]
+    Q --> T[GapAnalysisPanel + FullDetailWindow]
     T -->|references .md| U[MarkdownViewer]
+
+    V --> GT[GraphTerminalView]
+    GT -->|POST /api/graph/query or /path| VP[VertexProxy :8000]
+    VP --> M
 ```
 
 ### Execution Bridge
 
 ```
 SwiftUI (PythonBridge)
-    └── bash execute_pipeline.sh [--idea "..."]
-            ├── Activates Backend/.venv
-            ├── Starts VertexProxy (uvicorn :8000) if not running
-            └── python3 main.py → IngestSeedUseCase.execute()
-                    └── stdout: PROGRESS lines + ---PIPELINE_RESULT_START--- JSON
+    ├── HistoryView — enumerate runs/session_* on disk; load historical graph + gap JSON
+    ├── InputView — runPipeline(idea:) → Process
+    └── GraphTerminalView — URLSession POST → VertexProxy /api/graph/query|path
+
+execute_pipeline.sh [--idea "..."] [--url "..."]
+    ├── Activates Backend/.venv
+    ├── Starts VertexProxy (uvicorn :8000) if not running
+    └── python3 main.py → IngestSeedUseCase.execute()
+            ├── FileStorage.create_session_dir(idea)  → RESEARCHBOT_SESSION_DIR
+            └── stdout: PROGRESS lines + ---PIPELINE_RESULT_START--- JSON
 ```
 
 ---
 
 ## 4. Pipeline Phases (Backend)
+
+All on-disk outputs below are relative to the **active session directory**:
+
+`research_knowledge_base/runs/session_<UTC_TIMESTAMP>_<slug>/`
 
 ### Phase 1 & 1.5: Ingestion & Intent Analysis
 
@@ -97,13 +117,13 @@ SwiftUI (PythonBridge)
 |------|--------|
 | **Entry** | `InputAnalyzer.analyze_seed(raw_seed)` |
 | **Model** | Gemini 2.5 Flash (global + `STABLE_REGIONS` failover) |
-| **Outputs** | `core_context`, `search_keywords`, `extracted_urls`, `user_intent` |
+| **Outputs** | `core_context`, `search_keywords`, `extracted_urls`, `user_intent` (in-memory only until later phases write files) |
 | **Swift input** | User topic via `--idea`; optional `--url` appended to seed |
 
 ### Phase 2: Discovery Scraping (Concurrent)
 
-| Scraper | Module | Output location |
-|---------|--------|-----------------|
+| Scraper | Module | Output location (within session) |
+|---------|--------|----------------------------------|
 | Firecrawl (sequential first) | `WebScraper.py` | `agent_scrapes/` |
 | Social (parallel) | `SocialScraper.py` | `raw_ingestion/` |
 | Academic (parallel) | `AcademicScraper.py` | `agent_scrapes/` |
@@ -111,6 +131,7 @@ SwiftUI (PythonBridge)
 
 * **Concurrency:** `ThreadPoolExecutor` with `_PHASE2_WORKERS = 3`
 * Every saved scrape is appended to `current_run_files` via `path.resolve()`
+* **API:** `save_markdown(subdir_key, topic, content, session_dir=...)`
 
 ### Phase 2.5: Noise Reduction & Primary Refinement
 
@@ -119,7 +140,7 @@ SwiftUI (PythonBridge)
 | **Module** | `DataRefiner.refine_scraped_data(raw_corpus)` |
 | **Model** | Gemini 2.5 Pro (`max_output_tokens=65536`) |
 | **Input** | In-memory corpus only: `web_md`, `social_md`, `wiki_md`, `academic_md`, `deep_crawl_md` |
-| **Output** | Clean Markdown research ledger; section **"High-Value URLs for Next Crawl Phase"** |
+| **Output** | Clean Markdown research ledger in `agent_scrapes/`; section **"High-Value URLs for Next Crawl Phase"** |
 | **Failure** | `RuntimeError` on regional exhaustion → orchestrator skips corrupt file write |
 
 ### Phase 2.6: Recursive Deep-Crawl & URL Refinement
@@ -127,10 +148,10 @@ SwiftUI (PythonBridge)
 | Item | Detail |
 |------|--------|
 | **URL extraction** | Gemini 2.5 Flash parses Phase 2.5 output → `Title [URL]` lines |
-| **Per-URL worker** | `deep_crawl_urls` → `refine_scraped_data` → `save_markdown(..., *_URLRefiner)` |
+| **Per-URL worker** | `deep_crawl_urls` → `refine_scraped_data` → `save_markdown(..., *_URLRefiner, session_dir=...)` |
 | **Concurrency** | `ThreadPoolExecutor`, `_PHASE26_MAX_WORKERS = 5`, `threading.Lock` on `current_run_files` |
 | **Anti-bot guard** | Skips payloads containing captcha / 403 / empty-scrape indicators |
-| **Naming** | Files use `_URLRefiner` suffix for Phase 4 visibility |
+| **Naming** | Files use `_URLRefiner` suffix for Phase 4 visibility and HistoryView metrics |
 
 ### Phase 3: Synthesis & Storage
 
@@ -145,15 +166,15 @@ SwiftUI (PythonBridge)
 
 | Item | Detail |
 |------|--------|
-| **Module** | `GraphifyRunner.run_graphify(current_run_files)` |
-| **Session isolation** | Temp dir `temp_graph_input/` with only current-run refined Markdown |
-| **Inclusion rules** | Academic refinement summary, `processed_summaries`, `# Wiki:` / `# Wikipedia:` headers, `*_URLRefiner.md` |
-| **Extraction** | Graphify CLI via `OLLAMA_BASE_URL=http://localhost:8000` → VertexProxy → **Llama 4 Scout** |
+| **Module** | `GraphifyRunner.run_graphify(current_run_files, session_dir=...)` |
+| **Session isolation** | Temp dir `session_dir/temp_graph_input/` with only current-run refined Markdown; artefacts land in `session_dir/graphify-out/` |
+| **Inclusion rules** | Academic refinement summary, `processed_summaries`, `# Wiki:` / `# Wikipedia:` headers, `*_URLRefiner.md`, `agent_scrapes` refinement outputs |
+| **Extraction** | Graphify CLI via `OLLAMA_BASE_URL=http://localhost:8000/v1` → VertexProxy → **Llama 4 Scout** |
 | **Token budget** | `--token-budget 1500` (micro-chunking for granular node/edge extraction) |
 | **Post-processing** | Resizable sidebar injection in `graph.html`; Gemini 2.5 Flash community naming patched into `graph.json` + `graph.html` |
-| **Artifacts** | Moved to `research_knowledge_base/graphify-out/` |
+| **Artifacts** | `session_dir/graphify-out/` only — never the legacy shared root |
 
-**Graphify outputs:**
+**Graphify outputs (per session):**
 
 | File | Purpose |
 |------|---------|
@@ -180,7 +201,8 @@ Phase 4.5 avoids a single monolithic Gemini call over the full graph + corpus (h
 
 | Item | Detail |
 |------|--------|
-| **Module** | `GraphAnalyzer.analyze_graph_topology(current_run_files, graph_json_path=None)` |
+| **Module** | `GraphAnalyzer.analyze_graph_topology(current_run_files, graph_json_path=...)` |
+| **Graph input** | `session_dir/graphify-out/graph.json` (passed explicitly by orchestrator) |
 | **Entry** | Sync wrapper; inner orchestration via `asyncio.run(_run_map_reduce_analysis_async(...))` |
 | **Trigger** | `IngestSeedUseCase` after successful Phase 4 only |
 | **Model** | Gemini 2.5 Pro (`response_mime_type=application/json`) |
@@ -188,6 +210,7 @@ Phase 4.5 avoids a single monolithic Gemini call over the full graph + corpus (h
 | **Corpus I/O** | `_load_source_corpus_async()` — concurrent per-file reads via `asyncio.gather` + `asyncio.to_thread` |
 | **Per-file safety** | `_MAX_CHARS_PER_FILE = 120_000` tail-trim only for extreme single-file outliers |
 | **Reference hygiene** | `_sanitize_references()` drops any filename not present in the loaded corpus |
+| **Persistence** | Orchestrator writes `session_dir/academic_gap_analysis.json` for HistoryView reload |
 
 **Map tasks (3 parallel `asyncio.gather` calls):**
 
@@ -226,12 +249,28 @@ _PROMPT_<CATEGORY>
 **Stdout progress examples:**
 
 ```
+PROGRESS: Session — workspace allocated at .../runs/session_20260520T235831Z_topic_slug
 PROGRESS: Phase 4.5 — Map-Reduce: 3 parallel category analyses + executive summary...
 PROGRESS: Phase 4.5 — loaded N source files (async I/O).
 PROGRESS: Phase 4.5 — routing Structural Holes to europe-west4...
 PROGRESS: Phase 4.5 — ✓ High-Degree Limitations complete via us-east4 (4 entries).
-PROGRESS: Phase 4.5 — routing Executive Summary to global...
 PROGRESS: Phase 4.5 — ✓ academic gap analysis complete.
+```
+
+### Session Manifest (orchestrator-written)
+
+After Phase 3, `IngestSeedUseCase` writes `session_dir/session_manifest.json`:
+
+```json
+{
+  "session_id": "session_20260520T235831Z_ai_agents_for_automated_code_review",
+  "topic": "user seed idea",
+  "primary_keyword": "first search keyword",
+  "user_intent": "General Inquiry",
+  "saved_files": ["absolute paths..."],
+  "url_refiner_count": 22,
+  "created_at": "20260520T235831Z"
+}
 ```
 
 ---
@@ -239,17 +278,31 @@ PROGRESS: Phase 4.5 — ✓ academic gap analysis complete.
 ## 5. Knowledge Base Layout
 
 ```
-/research_knowledge_base/          # Sibling to Backend/ (resolved by FileStorage.get_kb_root())
-├── raw_ingestion/                 # Social scraper dumps (Reddit/X, etc.)
-├── agent_scrapes/                 # Web, Wiki, Academic, URLRefiner, Phase 2.5 refinement
-├── processed_summaries/             # Phase 3 synthesis Markdown
-└── graphify-out/                  # Phase 4 artifacts (gitignored in repo root .gitignore)
-    ├── graph.json
-    ├── graph.html
-    └── GRAPH_REPORT.md
+/research_knowledge_base/          # Sibling to Backend/ (FileStorage.get_kb_root())
+├── runs/                          # All pipeline executions (canonical, isolated)
+│   └── session_<UTC_TIMESTAMP>_<slug>/
+│       ├── agent_scrapes/         # Web, Wiki, Academic, URLRefiner, Phase 2.5 refinement
+│       ├── raw_ingestion/         # Social scraper dumps
+│       ├── processed_summaries/   # Phase 3 synthesis Markdown
+│       ├── graphify-out/          # Phase 4 artefacts (gitignored)
+│       │   ├── graph.json
+│       │   ├── graph.html
+│       │   └── GRAPH_REPORT.md
+│       ├── session_manifest.json  # HistoryView metadata
+│       └── academic_gap_analysis.json  # Persisted Phase 4.5 payload
+├── agent_scrapes/                 # Legacy shared folders (pre-session runs; optional)
+├── raw_ingestion/
+├── processed_summaries/
+└── graphify-out/
 ```
 
-Historical ledgers are preserved unless the user explicitly requests cleanup (`clean_kb.sh`).
+**Session allocation (`FileStorage.create_session_dir`):**
+
+* Creates `runs/session_<YYYYMMDDTHHMMSSZ>_<sanitized_topic>/` with all four `SESSION_SUBDIRS` pre-created
+* Sets `os.environ["RESEARCHBOT_SESSION_DIR"]` to the absolute path (immutable for that process)
+* Helpers: `list_sessions()`, `resolve_session_dir(session_id)`, `session_id_from_path()`
+
+Historical sessions under `runs/` are preserved unless the user explicitly requests cleanup (`clean_kb.sh`, which clears contents of each top-level KB subfolder including `runs/`).
 
 ---
 
@@ -273,11 +326,13 @@ Live progress lines (`PROGRESS: Phase X — ...`) are streamed to the Swift cons
 |-----|------|-------------|
 | `status` | string | `"success"` or `"error"` |
 | `message` | string | Human-readable result |
-| `graph_path` | string | Absolute path to `graphify-out/graph.html` |
+| `graph_path` | string | Absolute path to `session_dir/graphify-out/graph.html` |
 | `kb_root` | string | Absolute path to `research_knowledge_base/` (for Markdown resolution) |
+| `session_id` | string | Session directory basename (e.g. `session_20260520T235831Z_topic`) |
+| `session_path` | string | Absolute path to the isolated session workspace |
 | `phase` | string | Last completed phase label |
 | `seed_analysis` | object | `core_context`, `search_keywords`, `extracted_urls`, `user_intent` |
-| `saved_files` | string[] | All artifact paths written this run |
+| `saved_files` | string[] | All artifact paths written this run (under `session_path`) |
 | `synthesis_preview` | string | First 500 chars of Phase 3 synthesis |
 | `graphify` | object | `{ ran, stdout, error }` |
 | `academic_gap_analysis` | object | Phase 4.5 structured insights (see below) |
@@ -322,19 +377,50 @@ Live progress lines (`PROGRESS: Phase X — ...`) are streamed to the Swift cons
 
 On Graphify failure, the orchestrator still returns a valid object with empty category arrays and an `error` message so Swift decoding never breaks.
 
+### Interactive Graph API (VertexProxy :8000)
+
+Registered **before** the OpenAI catch-all proxy route. Swift `GraphTerminalView` calls these via `URLSession`; Python `GraphifyRunner` shells out to the Graphify CLI.
+
+| Method | Path | Body | Response |
+|--------|------|------|----------|
+| `GET` | `/api/graph/sessions` | — | `{ "sessions": ["session_...", ...] }` |
+| `POST` | `/api/graph/query` | `{ "session_id", "question" }` | `{ "ok": true, "stdout": "..." }` or `{ "ok": false, "error": "..." }` |
+| `POST` | `/api/graph/path` | `{ "session_id", "source", "target" }` | `{ "ok": true, "stdout": "..." }` or `{ "ok": false, "error": "..." }` |
+
+**CLI mapping (`GraphifyRunner`):**
+
+```
+graphify query  <session_dir/graphify-out>  "<question>"
+graphify path   <session_dir/graphify-out>  "<source>"  "<target>"
+```
+
+`session_id` resolves via `FileStorage.resolve_session_dir()` (full dirname, timestamp prefix, or partial match).
+
+**Macro presets (GraphTerminalView):**
+
+| UI control | Submitted question / action |
+|------------|----------------------------|
+| Extract Core Gaps | `"What are the most commonly cited limitations or future work recommendations in the scraped academic papers?"` |
+| Problem Intersection | `"How does the societal problem intersect with the limitations of current technologies?"` |
+| Find Contribution Path | `POST /api/graph/path` with Source Node + Target Node fields |
+
+VertexProxy must remain running (started by `execute_pipeline.sh`) for live console queries from the app.
+
 ---
 
 ## 7. SwiftUI Frontend Architecture
 
-**Boundary rule:** Swift handles layout, navigation, process spawning, and file display only. No scraping, no LLM calls, no graph extraction in Swift.
+**Boundary rule:** Swift handles layout, navigation, process spawning, HTTP to VertexProxy graph endpoints, and file display only. No scraping, no LLM calls, no graph extraction in Swift.
 
 ### Module map
 
 | File | Responsibility |
 |------|----------------|
 | `ResearchBotApp.swift` | App entry |
-| `ContentView.swift` | `InputView` ↔ `GraphView` navigation |
-| `PythonBridge.swift` | `Process()` → `execute_pipeline.sh`; parses `PipelineResult` |
+| `ContentView.swift` | `AppScreen` routing: History → Input → Graph |
+| `HistoryView.swift` | Landing dashboard; enumerates `runs/session_*`; loads historical graph + gap JSON |
+| `PythonBridge.swift` | `Process()` → `execute_pipeline.sh`; parses `PipelineResult`; `URLSession` graph console |
+| `GraphTerminalView.swift` | Interactive console: macros, path finder, transcript |
 | `GapAnalysisPanel.swift` | Concise right-side summary (metrics + CTA) |
 | `FullDetailWindow.swift` | Sheet: full gap breakdown + reference navigation |
 | `MarkdownViewer.swift` | Native Markdown reader for source verification |
@@ -342,12 +428,21 @@ On Graphify failure, the orchestrator still returns a valid object with empty ca
 ### Screen flow
 
 ```
+HistoryView (initial landing)
+  ├── Card grid: timestamp, topic, URLRefiner count, session id
+  ├── Tap card → PythonBridge.loadHistoricalSession() → GraphView
+  └── "New Research" → InputView
+
 InputView
   └── Run Research → PythonBridge.runPipeline(idea:)
         └── on graph_path + success → GraphView
 
-GraphView (HSplitView)
-  ├── GraphWebView (WKWebView → graph.html + sibling assets)
+GraphView (HSplitView + optional bottom console)
+  ├── GraphWebView (WKWebView → session/graphify-out/graph.html)
+  ├── GraphTerminalView (toggle via toolbar "Console")
+  │     ├── Macros: Extract Core Gaps, Problem Intersection
+  │     ├── Path finder: Source / Target → /api/graph/path
+  │     └── Custom query → /api/graph/query
   └── GapAnalysisPanel
         ├── Executive summary
         ├── Metric chips (hole / limitation / orphaned counts)
@@ -359,7 +454,7 @@ FullDetailWindow (NavigationStack)
   └── on reference tap → MarkdownViewer (in-place push)
 
 MarkdownViewer
-  ├── Resolves filename under kb_root (recursive search)
+  ├── Resolves filename under kb_root (recursive search, including session subfolders)
   ├── Lightweight MarkdownParser (headings, bullets, code, quotes)
   ├── Toolbar: Back → FullDetailWindow, Reveal in Finder
 ```
@@ -372,14 +467,21 @@ MarkdownViewer
 | `progress` | Accumulated stdout |
 | `graphFilePath` | `graph_path` |
 | `kbRoot` | `kb_root` |
-| `academicGapAnalysis` | `academic_gap_analysis` |
+| `sessionId` | `session_id` |
+| `sessionPath` | `session_path` |
+| `academicGapAnalysis` | `academic_gap_analysis` or `session_dir/academic_gap_analysis.json` (historical load) |
 | `synthesisPreview` | `synthesis_preview` |
 | `errorMessage` | `status == "error"` or decode failure |
+
+**Historical reload:** `loadHistoricalSession(_:)` sets `graphFilePath`, `sessionId`, `sessionPath`, `kbRoot`, and decodes `academic_gap_analysis.json` from the session folder.
+
+**Graph console:** `runGraphQuery(question:)` and `runGraphPath(source:target:)` POST to `http://localhost:8000/api/graph/...` (300s timeout).
 
 ### Codable models (`GapAnalysisPanel.swift`)
 
 * `AcademicGapAnalysis` — root payload
 * `StructuralHole`, `HighDegreeLimitation`, `OrphanedSolution` — category entries with optional `references: [String]`
+* `PipelineResult` — includes `sessionId`, `sessionPath` (`PythonBridge.swift`)
 
 ---
 
@@ -389,15 +491,15 @@ MarkdownViewer
 Backend/
 ├── main.py                          # CLI entry; PIPELINE_RESULT envelope
 ├── application/
-│   ├── IngestSeedUseCase.py         # Orchestrator (Phases 1.5 → 4.5)
+│   ├── IngestSeedUseCase.py         # Orchestrator; create_session_dir; manifest + gap JSON persist
 │   ├── InputAnalyzer.py             # Phase 1.5
 │   ├── DataRefiner.py               # Phase 2.5
 │   ├── AgentSynthesizer.py          # Phase 3
 │   └── GraphAnalyzer.py             # Phase 4.5 (Map-Reduce, async corpus I/O)
 └── infrastructure/
-    ├── VertexProxy.py               # FastAPI :8000; Llama 4 Scout + pinned Gemini routing
-    ├── GraphifyRunner.py            # Phase 4 shell + post-process
-    ├── FileStorage.py               # KB paths, save_markdown, get_kb_root
+    ├── VertexProxy.py               # FastAPI :8000; /api/graph/* + OpenAI proxy
+    ├── GraphifyRunner.py            # Phase 4; execute_graph_query; execute_graph_path
+    ├── FileStorage.py               # Session dirs, save_markdown, RESEARCHBOT_SESSION_DIR
     ├── WebScraper.py                # Firecrawl
     ├── SocialScraper.py
     ├── AcademicScraper.py
@@ -409,9 +511,9 @@ Backend/
 | Script | Role |
 |--------|------|
 | `execute_pipeline.sh` | venv activate, VertexProxy lifecycle, `main.py "$@"` |
-| `run.sh` | Environment bootstrap |
-| `clean_kb.sh` | Deep-clean inner KB files (preserves top-level folders) |
-| `test_backend.sh` | Backend smoke tests |
+| `run.sh` | GCP + Firecrawl checks, Xcode build, launch `.app` (no graph path verification) |
+| `clean_kb.sh` | Deep-clean contents of each top-level KB subfolder (including `runs/`) |
+| `test_backend.sh` | Full pipeline smoke test; verifies artefacts via `session_path` from PIPELINE_RESULT JSON |
 
 ---
 
@@ -451,27 +553,37 @@ Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `Input
 
 ### Code generation rules
 
-1. **Strict separation** — Swift: UI + `Process` management. Python: APIs, scraping, LLM, Graphify, gap analysis. Do not mix environments.
+1. **Strict separation** — Swift: UI + `Process` management + graph HTTP. Python: APIs, scraping, LLM, Graphify, gap analysis. Do not mix environments.
 2. **SwiftUI state** — Use `@Observable` on `PythonBridge`. Stream stdout for live console in `InputView`.
 3. **No unapproved commits** — No `git commit` or `git push` without explicit user authorization in chat.
 
+### Workspace run isolation rules
+
+1. **Session-first writes** — Every `save_markdown` and Graphify artefact must target `runs/session_<TIMESTAMP>_<slug>/`, never the legacy shared roots.
+2. **Immutable session env** — `RESEARCHBOT_SESSION_DIR` is set once at `create_session_dir()` and must not be overwritten mid-run.
+3. **Corpus fidelity** — `current_run_files` must only contain paths under the active session (or in-memory equivalents before write).
+4. **Historical preservation** — Do not delete `runs/session_*` directories unless the user explicitly requests cleanup.
+5. **Verification** — `test_backend.sh` must parse `session_path` from PIPELINE_RESULT JSON; do not verify the legacy `research_knowledge_base/graphify-out/` path alone.
+
 ### Graphify integration rules
 
-1. **Report monitoring** — Consult `graphify-out/GRAPH_REPORT.md` for structural holes and central nodes before advising on literature positioning.
+1. **Report monitoring** — Consult `session_dir/graphify-out/GRAPH_REPORT.md` for structural holes and central nodes.
 2. **Incremental updates** — Run `graphify update` locally for structural additions without re-running extraction.
+3. **Interactive queries** — Use `execute_graph_query` / `execute_graph_path` (or HTTP wrappers) scoped to `session_dir/graphify-out/` only.
 
 ### Phase 4.5 / gap-analysis rules
 
-1. **Corpus fidelity** — Always pass `current_run_files` from the orchestrator; never analyze stale disk files outside the run queue.
+1. **Corpus fidelity** — Always pass `current_run_files` from the orchestrator; pass `graph_json_path=session_dir/graphify-out/graph.json`.
 2. **Reference integrity** — Only filenames actually loaded in `_load_source_corpus_async` may appear in `references`; Python sanitizes LLM output before bridging.
 3. **Map-Reduce contract** — Do not collapse Phase 4.5 back into a single mega-prompt; keep three category-specific map tasks plus the digest-based summary reduce step.
 4. **Regional isolation** — A 429 in one category’s region must only advance that task’s failover chain, not block sibling `asyncio.gather` tasks.
 5. **UI layering** — Summary metrics in `GapAnalysisPanel`; deep content and source links in `FullDetailWindow` + `MarkdownViewer`.
+6. **Persist for HistoryView** — Write `academic_gap_analysis.json` beside the session graph so archival runs reload without re-running Phase 4.5.
 
 ### File system integrity
 
-1. **Folder preservation** — Clean utilities preserve top-level KB architecture.
-2. **No data deletion** — Do not purge historical research ledgers unless explicitly requested.
+1. **Folder preservation** — `clean_kb.sh` clears contents inside top-level KB subfolders but preserves the folder structure.
+2. **No data deletion** — Do not purge `runs/session_*` unless explicitly requested.
 
 ---
 
@@ -481,25 +593,35 @@ Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `Input
 |-------------|-------|
 | `GOOGLE_CLOUD_PROJECT_ID` | Vertex AI / Gemini (ADC) |
 | `.env` at repo root | Loaded by Backend modules and `execute_pipeline.sh` |
-| `Backend/.venv` | Created via `run.sh` |
-| VertexProxy on `:8000` | Auto-started by `execute_pipeline.sh` |
+| `Backend/.venv` | Python dependencies for pipeline + tests |
+| VertexProxy on `:8000` | Auto-started by `execute_pipeline.sh`; required for GraphTerminalView |
 | Firecrawl Docker | Phase 2 / 2.6 crawling |
-| Graphify CLI | Phase 4 (`ollama` backend pointed at VertexProxy) |
+| Graphify CLI | Phase 4 + interactive query/path |
 | Xcode 26+ | macOS app target `ResearchBot` |
 
-Optional: `BRIDGE_SCRIPT_PATH` env var overrides `execute_pipeline.sh` location for Xcode schemes.
+Optional environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `BRIDGE_SCRIPT_PATH` | Overrides `execute_pipeline.sh` location for Xcode schemes |
+| `RESEARCHBOT_SESSION_DIR` | Set by Python orchestrator; absolute active session path |
+| `RESEARCHBOT_KB_ROOT` | Optional override for Swift `HistoryView` KB discovery |
 
 ---
 
 ## 12. Quick Reference: Phase → File → Output
 
-| Phase | Primary module | Key output |
-|-------|----------------|------------|
+| Phase | Primary module | Key output (under `runs/session_<ts>_<slug>/`) |
+|-------|----------------|------------------------------------------------|
+| 0 | `FileStorage.create_session_dir` | Session workspace + `RESEARCHBOT_SESSION_DIR` |
 | 1.5 | `InputAnalyzer.py` | Seed analysis JSON (in-memory) |
-| 2 | Scrapers + `WebScraper` | `*.md` in `agent_scrapes` / `raw_ingestion` |
-| 2.5 | `DataRefiner.py` | Refined ledger `.md` |
-| 2.6 | `IngestSeedUseCase` workers | `*_URLRefiner.md` |
+| 2 | Scrapers + `WebScraper` | `agent_scrapes/*.md`, `raw_ingestion/*.md` |
+| 2.5 | `DataRefiner.py` | Refined ledger in `agent_scrapes/` |
+| 2.6 | `IngestSeedUseCase` workers | `*_URLRefiner.md` in `agent_scrapes/` |
 | 3 | `AgentSynthesizer.py` | `processed_summaries/*.md` |
+| 3b | `IngestSeedUseCase` | `session_manifest.json` |
 | 4 | `GraphifyRunner.py` | `graphify-out/graph.{json,html}` |
-| 4.5 | `GraphAnalyzer.py` | `academic_gap_analysis` (3 parallel map + summary reduce) |
+| 4.5 | `GraphAnalyzer.py` | `academic_gap_analysis` JSON (+ persisted `.json`) |
+| UI | `HistoryView` | Archive browser + historical graph reload |
+| UI | `GraphTerminalView` | Live `graphify query` / `path` via VertexProxy |
 | UI | `ContentView` + panels | Graph + gap summary + source viewer |

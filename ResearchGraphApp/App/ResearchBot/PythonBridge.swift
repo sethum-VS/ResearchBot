@@ -2,16 +2,19 @@
 //  PythonBridge.swift
 //  ResearchBot
 //
-//  ObservableObject that executes execute_pipeline.sh via Process().
-//  Captures stdout, parses the JSON bridging contract, and exposes
-//  typed state for SwiftUI consumption.
+//  Observable bridge to the Python backend.
+//  - Spawns execute_pipeline.sh via Process() and parses the JSON contract.
+//  - Talks to the local VertexProxy (http://localhost:8000) for the
+//    interactive Graphify console (`graphify query` / `graphify path`).
 //
-//  Swift handles ONLY process management — no business logic here.
+//  Swift handles ONLY process management + HTTP — no business logic here.
 //
 
 import Foundation
 
-/// Decoded payload from the Python backend's JSON contract.
+// MARK: - Pipeline JSON Contract
+
+/// Decoded payload from the Python backend's JSON envelope.
 struct PipelineResult: Codable {
     let status: String
     let message: String
@@ -20,6 +23,8 @@ struct PipelineResult: Codable {
     let phase: String?
     let synthesisPreview: String?
     let academicGapAnalysis: AcademicGapAnalysis?
+    let sessionId: String?
+    let sessionPath: String?
 
     enum CodingKeys: String, CodingKey {
         case status, message, phase
@@ -27,7 +32,17 @@ struct PipelineResult: Codable {
         case kbRoot = "kb_root"
         case synthesisPreview = "synthesis_preview"
         case academicGapAnalysis = "academic_gap_analysis"
+        case sessionId = "session_id"
+        case sessionPath = "session_path"
     }
+}
+
+// MARK: - Graph Terminal Response
+
+struct GraphConsoleResponse: Codable {
+    let ok: Bool
+    let stdout: String?
+    let error: String?
 }
 
 @MainActor
@@ -43,17 +58,19 @@ final class PythonBridge {
     var kbRoot: String?
     var synthesisPreview: String?
     var academicGapAnalysis: AcademicGapAnalysis?
+    var sessionId: String?
+    var sessionPath: String?
+
+    /// Local FastAPI proxy that hosts the interactive graph endpoints.
+    private let proxyBaseURL = URL(string: "http://localhost:8000")!
 
     // MARK: - Script Resolution
 
-    /// Locates execute_pipeline.sh by walking up from the app bundle.
     private var scriptPath: String? {
-        // 1. Environment variable override (useful in Xcode scheme)
         if let envPath = ProcessInfo.processInfo.environment["BRIDGE_SCRIPT_PATH"] {
             if FileManager.default.fileExists(atPath: envPath) { return envPath }
         }
 
-        // 2. Walk up from the bundle to find the repo root
         var current = URL(fileURLWithPath: Bundle.main.bundlePath)
         for _ in 0..<10 {
             let candidate = current.appendingPathComponent("execute_pipeline.sh").path
@@ -63,9 +80,8 @@ final class PythonBridge {
         return nil
     }
 
-    // MARK: - Execution
+    // MARK: - Pipeline Execution
 
-    /// Runs the full pipeline asynchronously.
     func runPipeline(idea: String, url: String = "") {
         guard !isRunning else { return }
         guard let script = scriptPath else {
@@ -80,6 +96,8 @@ final class PythonBridge {
         kbRoot = nil
         synthesisPreview = nil
         academicGapAnalysis = nil
+        sessionId = nil
+        sessionPath = nil
 
         Task.detached(priority: .userInitiated) { [weak self] in
             await self?.executeProcess(script: script, idea: idea, url: url)
@@ -96,7 +114,6 @@ final class PythonBridge {
         }
         process.arguments = args
 
-        // Inherit the user's shell environment for GCP ADC, PATH, etc.
         var env = ProcessInfo.processInfo.environment
         let homeDir = NSHomeDirectory()
         let localBin = "\(homeDir)/.local/bin"
@@ -107,11 +124,9 @@ final class PythonBridge {
         process.standardOutput = stdoutPipe
         process.standardError = stdoutPipe
 
-        // Stream stdout lines for live progress
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let line = String(data: data, encoding: .utf8) else { return }
-            
             let bridge = self
             Task { @MainActor in
                 bridge?.progress += line
@@ -138,7 +153,6 @@ final class PythonBridge {
         }
     }
 
-    /// Extract the JSON object from stdout using the PIPELINE_RESULT markers.
     private func parseOutput(_ raw: String, exitCode: Int32) {
         let startMarker = "---PIPELINE_RESULT_START---"
         let endMarker = "---PIPELINE_RESULT_END---"
@@ -152,7 +166,8 @@ final class PythonBridge {
             return
         }
 
-        let jsonString = String(raw[startRange.upperBound..<endRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let jsonString = String(raw[startRange.upperBound..<endRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let jsonData = jsonString.data(using: .utf8) else {
             errorMessage = "Failed to convert result string to data."
             return
@@ -168,10 +183,99 @@ final class PythonBridge {
                 kbRoot = result.kbRoot
                 synthesisPreview = result.synthesisPreview
                 academicGapAnalysis = result.academicGapAnalysis
+                sessionId = result.sessionId
+                sessionPath = result.sessionPath
                 errorMessage = nil
             }
         } catch {
             errorMessage = "JSON decode error: \(error.localizedDescription)\n\nRaw JSON was:\n\(jsonString)"
+        }
+    }
+
+    // MARK: - Historical Session Loading
+
+    /// Load a previously-recorded session into the live observable state.
+    /// Reads `graph.html` and the persisted `academic_gap_analysis.json`
+    /// from `runs/session_<id>/` and populates `graphFilePath`,
+    /// `academicGapAnalysis`, `sessionId`, and `sessionPath`.
+    func loadHistoricalSession(_ session: HistorySession) {
+        graphFilePath = session.graphHTMLPath
+        kbRoot = session.kbRoot
+        sessionId = session.id
+        sessionPath = session.absolutePath
+        synthesisPreview = nil
+        errorMessage = nil
+
+        let gapURL = URL(fileURLWithPath: session.absolutePath)
+            .appendingPathComponent("academic_gap_analysis.json")
+
+        if let data = try? Data(contentsOf: gapURL),
+           let decoded = try? JSONDecoder().decode(AcademicGapAnalysis.self, from: data) {
+            academicGapAnalysis = decoded
+        } else {
+            academicGapAnalysis = nil
+        }
+    }
+
+    // MARK: - Interactive Graphify Console
+
+    /// POST /api/graph/query — `graphify query <session> "<question>"`.
+    func runGraphQuery(question: String) async -> Result<String, Error> {
+        guard let sid = sessionId, !sid.isEmpty else {
+            return .failure(GraphConsoleError.noActiveSession)
+        }
+        return await postConsole(
+            path: "/api/graph/query",
+            body: ["session_id": sid, "question": question]
+        )
+    }
+
+    /// POST /api/graph/path — `graphify path <session> "<source>" "<target>"`.
+    func runGraphPath(source: String, target: String) async -> Result<String, Error> {
+        guard let sid = sessionId, !sid.isEmpty else {
+            return .failure(GraphConsoleError.noActiveSession)
+        }
+        return await postConsole(
+            path: "/api/graph/path",
+            body: ["session_id": sid, "source": source, "target": target]
+        )
+    }
+
+    private func postConsole(path: String, body: [String: String]) async -> Result<String, Error> {
+        var request = URLRequest(url: proxyBaseURL.appendingPathComponent(path))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 300
+
+        do {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        } catch {
+            return .failure(error)
+        }
+
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let decoded = try JSONDecoder().decode(GraphConsoleResponse.self, from: data)
+            if decoded.ok, let stdout = decoded.stdout {
+                return .success(stdout)
+            }
+            return .failure(GraphConsoleError.backend(decoded.error ?? "Unknown backend error"))
+        } catch {
+            return .failure(error)
+        }
+    }
+}
+
+enum GraphConsoleError: LocalizedError {
+    case noActiveSession
+    case backend(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noActiveSession:
+            return "No active research session. Run a pipeline or open a historical run first."
+        case .backend(let msg):
+            return msg
         }
     }
 }

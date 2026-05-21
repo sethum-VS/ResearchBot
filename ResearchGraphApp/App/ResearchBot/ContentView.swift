@@ -5,11 +5,19 @@
 //  Created by Sethum Methsanda on 2026-05-09.
 //
 //  Professional macOS interface for the Research Graph pipeline.
-//  Two screens: Input → Knowledge Graph Viewer.
+//  Three screens: History (landing) → Input (new run) → Knowledge Graph Viewer.
 //
 
 import SwiftUI
 import WebKit
+
+// MARK: - App Routing
+
+enum AppScreen: Hashable {
+    case history
+    case input
+    case graph
+}
 
 // MARK: - Main Content View
 
@@ -17,27 +25,45 @@ struct ContentView: View {
     @State private var bridge = PythonBridge()
     @State private var idea: String = ""
     @State private var referenceURL: String = ""
-    @State private var showGraph = false
+    @State private var screen: AppScreen = .history
 
     var body: some View {
         Group {
-            if showGraph, let graphPath = bridge.graphFilePath {
-                GraphView(
-                    graphPath: graphPath,
-                    gapAnalysis: bridge.academicGapAnalysis,
-                    kbRoot: bridge.kbRoot,
-                    onBack: { showGraph = false }
+            switch screen {
+            case .history:
+                HistoryView(
+                    bridge: bridge,
+                    onNewRun: { screen = .input },
+                    onOpenSession: { _ in screen = .graph }
                 )
-            } else {
+            case .input:
                 InputView(
                     idea: $idea,
                     referenceURL: $referenceURL,
                     bridge: bridge,
-                    onGraphReady: { showGraph = true }
+                    onGraphReady: { screen = .graph },
+                    onBackToHistory: { screen = .history }
                 )
+            case .graph:
+                if let graphPath = bridge.graphFilePath {
+                    GraphView(
+                        graphPath: graphPath,
+                        gapAnalysis: bridge.academicGapAnalysis,
+                        kbRoot: bridge.kbRoot,
+                        bridge: bridge,
+                        onBack: { screen = .history }
+                    )
+                } else {
+                    // Defensive fallback — shouldn't normally happen.
+                    HistoryView(
+                        bridge: bridge,
+                        onNewRun: { screen = .input },
+                        onOpenSession: { _ in screen = .graph }
+                    )
+                }
             }
         }
-        .frame(minWidth: 720, minHeight: 560)
+        .frame(minWidth: 820, minHeight: 600)
     }
 }
 
@@ -48,17 +74,15 @@ struct InputView: View {
     @Binding var referenceURL: String
     @Bindable var bridge: PythonBridge
     var onGraphReady: () -> Void
+    var onBackToHistory: () -> Void
 
     @State private var hasError = false
 
     var body: some View {
         VStack(spacing: 0) {
-            // ── Header ──────────────────────────────────────────────
             headerBar
 
-            // ── Content ─────────────────────────────────────────────
             VStack(spacing: 24) {
-                // Input card
                 VStack(alignment: .leading, spacing: 12) {
                     Text("What do you want to research?")
                         .font(.title3.weight(.semibold))
@@ -84,7 +108,6 @@ struct InputView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                // Run button
                 Button {
                     bridge.runPipeline(idea: idea, url: referenceURL)
                 } label: {
@@ -106,7 +129,6 @@ struct InputView: View {
                 .controlSize(.large)
                 .disabled(bridge.isRunning || idea.trimmingCharacters(in: .whitespaces).isEmpty)
 
-                // Output console
                 if bridge.isRunning || !bridge.progress.isEmpty {
                     outputConsole
                 }
@@ -130,16 +152,27 @@ struct InputView: View {
         }
     }
 
-    // MARK: - Sub-views
-
     private var headerBar: some View {
         HStack(spacing: 10) {
+            Button {
+                onBackToHistory()
+            } label: {
+                Label("Archive", systemImage: "chevron.left")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.tint)
+
+            Spacer()
+
             Image(systemName: "atom")
                 .font(.title2)
                 .foregroundStyle(.tint)
             Text("Research Graph")
                 .font(.title2.weight(.bold))
+
             Spacer()
+
+            Color.clear.frame(width: 70)
         }
         .padding(.horizontal, 24)
         .padding(.vertical, 16)
@@ -187,10 +220,12 @@ struct GraphView: View {
     let graphPath: String
     let gapAnalysis: AcademicGapAnalysis?
     let kbRoot: String?
+    @Bindable var bridge: PythonBridge
     var onBack: () -> Void
 
     @State private var panelCollapsed = false
     @State private var showFullAnalysis = false
+    @State private var showTerminal = true
 
     private var placeholderAnalysis: AcademicGapAnalysis {
         AcademicGapAnalysis(
@@ -213,7 +248,7 @@ struct GraphView: View {
                 Button {
                     onBack()
                 } label: {
-                    Label("New Research", systemImage: "chevron.left")
+                    Label("Archive", systemImage: "chevron.left")
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.tint)
@@ -225,7 +260,14 @@ struct GraphView: View {
 
                 Spacer()
 
-                Color.clear.frame(width: 100)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showTerminal.toggle()
+                    }
+                } label: {
+                    Label("Console", systemImage: showTerminal ? "terminal.fill" : "terminal")
+                }
+                .buttonStyle(.bordered)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
@@ -235,9 +277,18 @@ struct GraphView: View {
             Divider()
 
             HSplitView {
-                GraphWebView(filePath: graphPath)
-                    .frame(minWidth: 400)
-                    .layoutPriority(1)
+                VStack(spacing: 0) {
+                    GraphWebView(filePath: graphPath)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                    if showTerminal {
+                        Divider()
+                        GraphTerminalView(bridge: bridge)
+                            .frame(height: 360)
+                    }
+                }
+                .frame(minWidth: 400)
+                .layoutPriority(1)
 
                 GapAnalysisPanel(
                     analysis: resolvedAnalysis,
@@ -272,9 +323,6 @@ struct GraphWebView: NSViewRepresentable {
     func updateNSView(_ webView: WKWebView, context: Context) {
         let fileURL = URL(fileURLWithPath: filePath)
         let directory = fileURL.deletingLastPathComponent()
-
-        // CRITICAL: loadFileURL with allowingReadAccessTo grants the
-        // WKWebView permission to read sibling files (JS, CSS, JSON).
         webView.loadFileURL(fileURL, allowingReadAccessTo: directory)
     }
 }

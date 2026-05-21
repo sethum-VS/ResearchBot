@@ -295,6 +295,120 @@ def _extract_finish_reason(response) -> str:
         return "stop"
 
 
+# ── Interactive Graph Console Routes (Task 2) ───────────────────────────────
+# Exposes Graphify's native `graphify query` and `graphify path` CLI tools
+# to the SwiftUI GraphTerminalView. Routes are registered BEFORE the OpenAI
+# catch-all below so FastAPI matches them first.
+
+@app.get("/api/graph/sessions")
+def api_list_sessions():
+    """Return every recorded session_id, newest first, for HistoryView."""
+    try:
+        from infrastructure.FileStorage import list_sessions
+        sessions = [p.name for p in list_sessions()]
+        return JSONResponse(content={"sessions": sessions})
+    except Exception as e:
+        logger.exception("Failed to list sessions")
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e), "sessions": []},
+        )
+
+
+@app.post("/api/graph/query")
+def api_graph_query(body: dict = Body(...)):
+    """
+    POST { "session_id": "...", "question": "..." }
+      → { "ok": true,  "session_id": "...", "stdout": "...console text..." }
+      → { "ok": false, "error": "..." }   (HTTP 400/404/500)
+
+    Shells out to ``graphify query <session_workspace> "<question>"`` via
+    ``GraphifyRunner.execute_graph_query`` and wraps the raw console output
+    in a JSON envelope for the SwiftUI terminal panel.
+    """
+    from infrastructure.GraphifyRunner import execute_graph_query, GraphifyError
+
+    session_id = (body.get("session_id") or "").strip()
+    question = (body.get("question") or "").strip()
+
+    if not session_id or not question:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "session_id and question are required."},
+        )
+
+    try:
+        stdout = execute_graph_query(session_id, question)
+    except FileNotFoundError as e:
+        return JSONResponse(status_code=404, content={"ok": False, "error": str(e)})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+    except GraphifyError as e:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e), "exit_code": e.exit_code},
+        )
+    except Exception as e:
+        logger.exception("graph query failed")
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+    return JSONResponse(content={
+        "ok": True,
+        "session_id": session_id,
+        "command": "query",
+        "stdout": stdout,
+    })
+
+
+@app.post("/api/graph/path")
+def api_graph_path(body: dict = Body(...)):
+    """
+    POST { "session_id": "...", "source": "...", "target": "..." }
+      → { "ok": true,  "stdout": "...console text..." }
+      → { "ok": false, "error": "..." }
+
+    Shells out to ``graphify path <session_workspace> "<source>" "<target>"``.
+    """
+    from infrastructure.GraphifyRunner import execute_graph_path, GraphifyError
+
+    session_id = (body.get("session_id") or "").strip()
+    source = (body.get("source") or "").strip()
+    target = (body.get("target") or "").strip()
+
+    if not session_id or not source or not target:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "error": "session_id, source, and target are required.",
+            },
+        )
+
+    try:
+        stdout = execute_graph_path(session_id, source, target)
+    except FileNotFoundError as e:
+        return JSONResponse(status_code=404, content={"ok": False, "error": str(e)})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
+    except GraphifyError as e:
+        return JSONResponse(
+            status_code=500,
+            content={"ok": False, "error": str(e), "exit_code": e.exit_code},
+        )
+    except Exception as e:
+        logger.exception("graph path failed")
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+
+    return JSONResponse(content={
+        "ok": True,
+        "session_id": session_id,
+        "command": "path",
+        "source": source,
+        "target": target,
+        "stdout": stdout,
+    })
+
+
 @app.post("/{path:path}")
 def proxy(path: str, request: Request, body: dict = Body(...)):
     """

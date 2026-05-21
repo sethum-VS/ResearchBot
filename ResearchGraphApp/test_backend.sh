@@ -75,27 +75,60 @@ fi
 # --- 3. Execute Pipeline via Bridge ---
 echo "🚀 Triggering Pipeline via execute_pipeline.sh..."
 cd "$SCRIPT_DIR"
+PIPELINE_LOG="$(mktemp)"
 set +e
-./execute_pipeline.sh --idea "AI Agents for Automated Code Review"
-PIPELINE_EXIT=$?
+./execute_pipeline.sh --idea "AI Agents for Automated Code Review" 2>&1 | tee "$PIPELINE_LOG"
+PIPELINE_EXIT=${PIPESTATUS[0]}
 set -e
 
 if [ "$PIPELINE_EXIT" -ne 0 ]; then
     echo "❌ Pipeline exited with code $PIPELINE_EXIT"
+    rm -f "$PIPELINE_LOG"
     exit "$PIPELINE_EXIT"
 fi
 
-# --- 4. Verify graph artifacts (nodes present in graph.json + graph.html) ---
-echo "🔍 Verifying knowledge graph artifacts..."
+# --- 4. Verify session-isolated graph artifacts ---
+echo "🔍 Verifying knowledge graph artifacts (session workspace)..."
 "$BACKEND_DIR/.venv/bin/python3" <<VERIFY
 import json
 import re
 import sys
 from pathlib import Path
 
-kb = Path("$SCRIPT_DIR/research_knowledge_base/graphify-out")
-json_path = kb / "graph.json"
-html_path = kb / "graph.html"
+log_path = Path("$PIPELINE_LOG")
+raw = log_path.read_text(encoding="utf-8", errors="replace")
+
+start = raw.find("---PIPELINE_RESULT_START---")
+end = raw.find("---PIPELINE_RESULT_END---")
+if start == -1 or end == -1 or start >= end:
+    print("❌ Pipeline result markers not found in stdout")
+    sys.exit(1)
+
+payload = json.loads(raw[start + len("---PIPELINE_RESULT_START---"):end].strip())
+if payload.get("status") != "success":
+    print(f"❌ Pipeline status: {payload.get('status')} — {payload.get('message')}")
+    sys.exit(1)
+
+session_path = payload.get("session_path")
+session_id = payload.get("session_id")
+graph_path = payload.get("graph_path")
+
+if not session_path:
+    print("❌ Pipeline result missing session_path (session isolation contract)")
+    sys.exit(1)
+
+session_dir = Path(session_path)
+graphify_out = session_dir / "graphify-out"
+json_path = graphify_out / "graph.json"
+html_path = graphify_out / "graph.html"
+
+print(f"✅ Session: {session_id}")
+print(f"✅ Workspace: {session_dir}")
+
+if graph_path and Path(graph_path).is_file():
+    print(f"✅ graph_path in payload: {graph_path}")
+else:
+    print(f"⚠️  graph_path missing or not on disk: {graph_path}")
 
 if not json_path.is_file():
     print(f"❌ Missing {json_path}")
@@ -103,6 +136,17 @@ if not json_path.is_file():
 if not html_path.is_file():
     print(f"❌ Missing {html_path}")
     sys.exit(1)
+
+manifest = session_dir / "session_manifest.json"
+gap_json = session_dir / "academic_gap_analysis.json"
+if manifest.is_file():
+    print(f"✅ session_manifest.json present")
+else:
+    print(f"⚠️  session_manifest.json missing")
+if gap_json.is_file():
+    print(f"✅ academic_gap_analysis.json present")
+else:
+    print(f"⚠️  academic_gap_analysis.json missing")
 
 data = json.loads(json_path.read_text(encoding="utf-8"))
 nodes = data.get("nodes") or []
@@ -118,7 +162,6 @@ html = html_path.read_text(encoding="utf-8", errors="ignore")
 html_ids = set(re.findall(r'"id"\s*:\s*"([^"]+)"', html))
 json_ids = {n.get("id") for n in nodes if n.get("id")}
 missing_in_html = json_ids - html_ids
-extra_in_html = html_ids - json_ids
 
 print(f"✅ graph.json: {len(nodes)} nodes, {len(links)} links")
 print(f"✅ graph.html: {len(html_ids)} node id references in markup")
@@ -126,12 +169,27 @@ print(f"✅ graph.html: {len(html_ids)} node id references in markup")
 if missing_in_html:
     sample = sorted(missing_in_html)[:8]
     print(f"⚠️  {len(missing_in_html)} node id(s) in graph.json not found in graph.html (sample: {sample})")
-    # Warn only — Graphify HTML layout may embed nodes differently
 else:
     print("✅ All graph.json node ids appear in graph.html")
 
+# Count URLRefiner docs in this session only
+scrape_dir = session_dir / "agent_scrapes"
+urlrefiner_count = 0
+if scrape_dir.is_dir():
+    urlrefiner_count = sum(
+        1 for f in scrape_dir.iterdir()
+        if f.suffix == ".md" and "_urlrefiner" in f.name.lower()
+    )
+print(f"✅ URLRefiner docs in session: {urlrefiner_count}")
+
+graphify_err = (payload.get("graphify") or {}).get("error")
+if graphify_err:
+    print(f"⚠️  graphify reported error: {graphify_err}")
+
 sys.exit(0)
 VERIFY
+
+rm -f "$PIPELINE_LOG"
 
 
 echo "✅ Backend test completed successfully."
