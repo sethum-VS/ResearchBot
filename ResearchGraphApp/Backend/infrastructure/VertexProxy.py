@@ -59,10 +59,25 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="ResearchBot Vertex AI Proxy")
 
-# Path resolution: infrastructure/VertexProxy.py -> infrastructure -> Backend -> ResearchGraphApp -> ResearchBot (root)
-root_dir = Path(__file__).resolve().parent.parent.parent.parent
-env_path = root_dir / ".env"
-load_dotenv(env_path)
+def _resolve_env_path() -> Path:
+    """User `.env` in Application Support (public .dmg); dev repo root as fallback."""
+    support = os.environ.get("APP_SUPPORT_DIR", "").strip()
+    if support:
+        return Path(support).expanduser() / ".env"
+    default = (
+        Path.home()
+        / "Library"
+        / "Application Support"
+        / "AutonomousResearchGraph"
+        / ".env"
+    )
+    if default.is_file():
+        return default
+    root_dir = Path(__file__).resolve().parent.parent.parent.parent
+    return root_dir / ".env"
+
+
+load_dotenv(_resolve_env_path())
 
 # 2. Get project ID with a fallback check
 _PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT_ID")

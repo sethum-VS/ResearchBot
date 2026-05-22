@@ -26,8 +26,25 @@ struct ContentView: View {
     @State private var idea: String = ""
     @State private var referenceURL: String = ""
     @State private var screen: AppScreen = .history
+    @State private var isEnvironmentReady = EnvironmentManager.checkEnvironmentExists()
 
     var body: some View {
+        Group {
+            if !isEnvironmentReady {
+                SetupWizardView {
+                    isEnvironmentReady = true
+                    screen = .history
+                }
+            } else {
+                mainAppContent
+            }
+        }
+        .frame(minWidth: 820, minHeight: 600)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    @ViewBuilder
+    private var mainAppContent: some View {
         Group {
             switch screen {
             case .history:
@@ -63,8 +80,6 @@ struct ContentView: View {
                 }
             }
         }
-        .frame(minWidth: 820, minHeight: 600)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 }
 

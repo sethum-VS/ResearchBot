@@ -22,10 +22,24 @@ if hasattr(sys.stdout, "reconfigure"):
 
 from dotenv import load_dotenv
 
-# Load .env from repo root (two levels up from Backend/)
-current_dir = os.path.dirname(os.path.abspath(__file__))
-env_path = os.path.abspath(os.path.join(current_dir, "..", "..", ".env"))
-load_dotenv(env_path)
+def _resolve_env_path() -> str:
+    support = os.environ.get("APP_SUPPORT_DIR", "").strip()
+    if support:
+        return os.path.join(support, ".env")
+    default = os.path.join(
+        os.path.expanduser("~"),
+        "Library",
+        "Application Support",
+        "AutonomousResearchGraph",
+        ".env",
+    )
+    if os.path.isfile(default):
+        return default
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.abspath(os.path.join(current_dir, "..", "..", ".env"))
+
+
+load_dotenv(_resolve_env_path())
 
 from application.ExportWorkspaceUseCase import export_to_workspace
 from application.IngestSeedUseCase import execute

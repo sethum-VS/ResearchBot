@@ -10,10 +10,22 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR/Backend"
 
-# Load .env from the project root (one level above ResearchGraphApp/)
-ENV_FILE="$SCRIPT_DIR/../.env"
+# Load .env from Application Support (set by Swift) or dev repo root.
+if [ -n "${APP_SUPPORT_DIR:-}" ]; then
+    ENV_FILE="${APP_SUPPORT_DIR}/.env"
+else
+    ENV_FILE="${HOME}/Library/Application Support/AutonomousResearchGraph/.env"
+fi
+
+if [ ! -f "$ENV_FILE" ]; then
+    DEV_ENV_FILE="$SCRIPT_DIR/../.env"
+    if [ -f "$DEV_ENV_FILE" ]; then
+        ENV_FILE="$DEV_ENV_FILE"
+    fi
+fi
+
 if [ -f "$ENV_FILE" ]; then
-    echo "📄 Loading environment variables from .env"
+    echo "📄 Loading environment variables from $ENV_FILE"
     set -a
     # shellcheck disable=SC1090
     source "$ENV_FILE"

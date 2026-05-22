@@ -117,15 +117,28 @@ final class PythonBridge {
         return FileManager.default.fileExists(atPath: path) ? path : nil
     }
 
-    // MARK: - Google Workspace paths (Swift checks token; Python writes it)
+    // MARK: - Application Support (`.env`, OAuth token)
 
     static var googleAppSupportDirectory: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("ResearchBot", isDirectory: true)
+        EnvironmentManager.applicationSupportDirectory
     }
 
     static var googleTokenFileURL: URL {
         googleAppSupportDirectory.appendingPathComponent("token.json")
+    }
+
+    /// Paths and OAuth credentials passed to every backend `Process()`.
+    nonisolated private static func applyBackendDeploymentPaths(to env: inout [String: String]) {
+        env["APP_SUPPORT_DIR"] = EnvironmentManager.applicationSupportDirectory.path
+
+        if let resourcePath = Bundle.main.resourcePath {
+            env["APP_BUNDLE_DIR"] = resourcePath
+            let bundledCreds = URL(fileURLWithPath: resourcePath)
+                .appendingPathComponent("credentials.json")
+            if FileManager.default.fileExists(atPath: bundledCreds.path) {
+                env["RESEARCHBOT_OAUTH_CREDENTIALS"] = bundledCreds.path
+            }
+        }
     }
 
     static var hasGoogleOAuthToken: Bool {
@@ -189,6 +202,7 @@ final class PythonBridge {
         let homeDir = NSHomeDirectory()
         let localBin = "\(homeDir)/.local/bin"
         env["PATH"] = "\(localBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+        Self.applyBackendDeploymentPaths(to: &env)
         process.environment = env
 
         let stdoutPipe = Pipe()
@@ -359,6 +373,7 @@ final class PythonBridge {
         var env = ProcessInfo.processInfo.environment
         let homeDir = NSHomeDirectory()
         env["PATH"] = "\(homeDir)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+        Self.applyBackendDeploymentPaths(to: &env)
         if let credentialsPath {
             env["RESEARCHBOT_OAUTH_CREDENTIALS"] = credentialsPath
         }
@@ -491,6 +506,7 @@ final class PythonBridge {
             let homeDir = NSHomeDirectory()
             let localBin = "\(homeDir)/.local/bin"
             env["PATH"] = "\(localBin):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+            PythonBridge.applyBackendDeploymentPaths(to: &env)
             process.environment = env
 
             let pipe = Pipe()

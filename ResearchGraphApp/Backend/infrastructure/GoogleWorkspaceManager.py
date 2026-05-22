@@ -32,12 +32,21 @@ SCOPES = [
 ]
 
 MASTER_DOC_TITLE = "ResearchBot — Master Tracking Document"
-APP_SUPPORT_DIR_NAME = "ResearchBot"
+APP_SUPPORT_DIR_NAME = "AutonomousResearchGraph"
 
 
 def app_support_dir() -> Path:
-    """macOS Application Support directory for ResearchBot (token + config)."""
-    base = Path.home() / "Library" / "Application Support" / APP_SUPPORT_DIR_NAME
+    """macOS Application Support (`.env`, OAuth token)."""
+    env_dir = os.environ.get("APP_SUPPORT_DIR", "").strip()
+    if env_dir:
+        base = Path(env_dir).expanduser()
+    else:
+        base = (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / APP_SUPPORT_DIR_NAME
+        )
     base.mkdir(parents=True, exist_ok=True)
     return base
 
@@ -52,14 +61,21 @@ def credentials_path() -> Path:
 
     Priority:
       1. RESEARCHBOT_OAUTH_CREDENTIALS env (set by Swift from app bundle)
-      2. Application Support credentials.json (optional user override)
-      3. Dev fallback: ResearchGraphApp/App/ResearchBot/credentials.json
+      2. APP_BUNDLE_DIR/credentials.json (shipped inside the .dmg)
+      3. Application Support credentials.json (optional user override)
+      4. Dev fallback: ResearchGraphApp/App/ResearchBot/credentials.json
     """
     env = os.environ.get("RESEARCHBOT_OAUTH_CREDENTIALS", "").strip()
     if env:
         p = Path(env).expanduser()
         if p.is_file():
             return p
+
+    bundle_dir = os.environ.get("APP_BUNDLE_DIR", "").strip()
+    if bundle_dir:
+        bundled = Path(bundle_dir).expanduser() / "credentials.json"
+        if bundled.is_file():
+            return bundled
 
     support_creds = app_support_dir() / "credentials.json"
     if support_creds.is_file():
@@ -72,7 +88,7 @@ def credentials_path() -> Path:
 
     raise FileNotFoundError(
         "OAuth credentials.json not found. Bundle it in the macOS app or set "
-        "RESEARCHBOT_OAUTH_CREDENTIALS."
+        "RESEARCHBOT_OAUTH_CREDENTIALS / APP_BUNDLE_DIR."
     )
 
 
