@@ -9,6 +9,7 @@ openai
 fastapi
 uvicorn
 tenacity
+pymupdf
 google-api-python-client
 google-auth-oauthlib
 google-auth-httplib2

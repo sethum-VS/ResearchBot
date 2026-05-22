@@ -273,6 +273,27 @@ def _strip_json_fences(text: str) -> str:
     return stripped
 
 
+def _extract_first_json_value(text: str) -> str:
+    """
+    Return the first complete JSON object/array from *text*.
+
+    Graphify/Llama often emit NDJSON or prose after a valid JSON block, which
+    causes ``Extra data: line 2 column 1`` when downstream parsers read the
+    full string.
+    """
+    stripped = _strip_json_fences(text)
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(stripped):
+        if ch not in "{[":
+            continue
+        try:
+            value, _end = decoder.raw_decode(stripped, idx)
+            return json.dumps(value, ensure_ascii=False)
+        except json.JSONDecodeError:
+            continue
+    return stripped
+
+
 def _extract_finish_reason(response) -> str:
     """
     Map the Vertex AI FinishReason enum to an OpenAI-compatible string.
@@ -637,7 +658,20 @@ def proxy(path: str, request: Request, body: dict = Body(...)):
         or getattr(gen_config, "response_mime_type", None) == "application/json"
     )
     if is_json_mode and text_out:
-        text_out = _strip_json_fences(text_out)
+        text_out = _extract_first_json_value(text_out)
+
+    # Llama / Graphify: strip NDJSON tails even without explicit JSON mode.
+    elif is_llama and text_out:
+        lead = text_out.lstrip()
+        if lead.startswith("{") or lead.startswith("[") or lead.startswith("```"):
+            sanitized = _extract_first_json_value(text_out)
+            if sanitized != text_out:
+                logger.info(
+                    "Llama JSON sanitised (%d → %d chars) for Graphify compatibility.",
+                    len(text_out),
+                    len(sanitized),
+                )
+                text_out = sanitized
 
     # ── Llama Debug Logging ──────────────────────────────────────────────
     if model_name.startswith("llama") or "llama" in resolved_model:

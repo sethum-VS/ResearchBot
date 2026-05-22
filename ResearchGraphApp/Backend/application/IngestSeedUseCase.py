@@ -49,6 +49,7 @@ import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 
 from google import genai
@@ -61,9 +62,14 @@ from application.GraphAnalyzer import analyze_graph_topology
 from infrastructure.WebScraper import firecrawl_advanced_search, deep_crawl_urls
 from infrastructure.SocialScraper import search_social_threads
 from infrastructure.WikiAPI import get_wiki_summary
-from infrastructure.AcademicScraper import search_academic_papers
+from infrastructure.AcademicScraper import (
+    AcademicSearchResult,
+    format_fulltext_artifact_markdown,
+    search_academic_papers,
+)
 from infrastructure.FileStorage import (
     create_session_dir,
+    ensure_session_structure,
     save_markdown,
     get_kb_root,
     session_id_from_path,
@@ -87,9 +93,18 @@ _STABLE_REGIONS: list[str] = [
 _URL_EXTRACT_PROMPT = (
     "You are a data extraction specialist. Look at the provided research summary "
     "and find the section regarding 'High-Value URLs for Next Crawl Phase'. "
-    "Extract every title and its associated URL. Format the output strictly as a "
-    "simple list of 'Title [URL]'. Return ONLY the list, with no preamble or explanation."
+    "Extract every title and its associated URL. Format the output strictly as one "
+    "entry per line: Title [https://full-url]. "
+    "Do NOT use section headings, bullet categories, markdown links, or bare URLs "
+    "without the bracketed https URL. "
+    "Example line: Google ADK Code Review Codelab [https://codelabs.developers.google.com/adk-code-reviewer-assistant/instructions]\n"
+    "Return ONLY the list, with no preamble or explanation."
 )
+
+_URL_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\)]+)\)")
+_URL_BRACKET_RE = re.compile(r"\[(https?://[^\]\s]+)\]")
+_BARE_URL_LINE_RE = re.compile(r"^\s*(https?://\S+)\s*$", re.MULTILINE)
+_SECTION_HEADER_RE = re.compile(r"^[A-Za-z0-9][^\n]{0,120}:\s*$")
 
 
 def _ensure_all_saved_md_in_run_queue(
@@ -116,11 +131,112 @@ def _is_resource_exhausted(exc: Exception) -> bool:
     return "429" in exc_str or "resourceexhausted" in exc_str or "resource_exhausted" in exc_str
 
 
+def _title_from_url(url: str) -> str:
+    """Derive a short crawl title from a URL path or host."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = (parsed.netloc or "source").replace("www.", "")
+    path = (parsed.path or "").strip("/").split("/")[-1] or host
+    slug = re.sub(r"[^\w\s-]", "", path.replace("-", " ").replace("_", " ")).strip()
+    return slug[:60] if slug else host.replace(".", "_")
+
+
+def _parse_url_entry(entry: str) -> tuple[str, str] | None:
+    """
+    Parse one high-value URL line into (title, url).
+    Supports Title [URL], markdown links, and bare https lines.
+    """
+    line = entry.strip()
+    if not line:
+        return None
+    if _SECTION_HEADER_RE.match(line) and "http" not in line.lower():
+        return None
+
+    md = _URL_MARKDOWN_LINK_RE.search(line)
+    if md:
+        title, url = md.group(1).strip(), md.group(2).strip()
+        if title and url and not title.endswith(":"):
+            return title, url
+
+    bracket = _URL_BRACKET_RE.search(line)
+    if bracket:
+        url = bracket.group(1).strip()
+        title_m = re.search(r"^[-*\d.\s]*(.+?)\s*\[https?://", line)
+        title = title_m.group(1).strip() if title_m else _title_from_url(url)
+        if title.endswith(":"):
+            title = _title_from_url(url)
+        return title, url
+
+    bare = _BARE_URL_LINE_RE.match(line)
+    if bare:
+        url = bare.group(1).strip().rstrip(".,;)")
+        return _title_from_url(url), url
+
+    return None
+
+
+def _format_url_entry(title: str, url: str) -> str:
+    return f"{title} [{url}]"
+
+
+def _dedupe_url_entries(entries: list[str]) -> list[str]:
+    """Keep first occurrence per URL; preserve Title [URL] format."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in entries:
+        parsed = _parse_url_entry(entry)
+        if not parsed:
+            continue
+        title, url = parsed
+        key = url.rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(_format_url_entry(title, url))
+    return out
+
+
+def _extract_urls_from_refined_section(refined_text: str) -> list[str]:
+    """Regex fallback when Flash returns section headers or bare URLs."""
+    if not refined_text or not refined_text.strip():
+        return []
+
+    lower = refined_text.lower()
+    marker = "high-value urls"
+    idx = lower.find(marker)
+    section = refined_text[idx:] if idx >= 0 else refined_text
+
+    entries: list[str] = []
+    for title, url in _URL_MARKDOWN_LINK_RE.findall(section):
+        title = title.strip()
+        if title and not title.endswith(":"):
+            entries.append(_format_url_entry(title, url))
+
+    for match in _URL_BRACKET_RE.finditer(section):
+        url = match.group(1).strip()
+        line_start = section.rfind("\n", 0, match.start()) + 1
+        line_end = section.find("\n", match.end())
+        if line_end == -1:
+            line_end = len(section)
+        line = section[line_start:line_end].strip()
+        parsed = _parse_url_entry(line)
+        if parsed:
+            entries.append(_format_url_entry(*parsed))
+
+    for bare in _BARE_URL_LINE_RE.findall(section):
+        url = bare.strip().rstrip(".,;)")
+        entries.append(_format_url_entry(_title_from_url(url), url))
+
+    return entries
+
+
 def _parse_url_extraction_response(response) -> list[str]:
-    """Turn Gemini response into a list of 'Title [URL]' lines."""
+    """Turn Gemini response into normalized 'Title [URL]' lines."""
     if not response or not response.text:
         return []
-    return [line.strip() for line in response.text.strip().split("\n") if line.strip()]
+    lines = [line.strip() for line in response.text.strip().split("\n") if line.strip()]
+    return _dedupe_url_entries(lines)
 
 
 @retry(
@@ -155,7 +271,8 @@ async def _extract_high_value_urls(refined_text: str) -> list[str]:
     try:
         client = genai.Client(vertexai=True, project=project_id, location="global")
         response = await _call_flash_async(client, contents)
-        return _parse_url_extraction_response(response)
+        entries = _parse_url_extraction_response(response)
+        return _merge_high_value_url_entries(entries, refined_text)
     except Exception as primary_exc:
         print(
             f"PROGRESS: Phase 2.6 — global endpoint failed ({primary_exc}). "
@@ -171,7 +288,7 @@ async def _extract_high_value_urls(refined_text: str) -> list[str]:
             response = await _call_flash_async(client, contents)
             lines = _parse_url_extraction_response(response)
             if lines:
-                return lines
+                return _merge_high_value_url_entries(lines, refined_text)
         except Exception as region_exc:
             print(f"PROGRESS: Phase 2.6 — region {region} failed: {region_exc}", flush=True)
             last_exc = region_exc
@@ -181,7 +298,33 @@ async def _extract_high_value_urls(refined_text: str) -> list[str]:
         "Failed to extract URLs via LLM after all regions. Last error: %s",
         last_exc,
     )
+    fallback = _extract_urls_from_refined_section(refined_text)
+    if fallback:
+        print(
+            f"PROGRESS: Phase 2.6 — LLM extraction failed; using {len(fallback)} "
+            f"URL(s) from refined Markdown fallback.",
+            flush=True,
+        )
+        return _dedupe_url_entries(fallback)
     return []
+
+
+def _merge_high_value_url_entries(
+    llm_entries: list[str],
+    refined_text: str,
+) -> list[str]:
+    """Combine Flash output with regex fallback; prefer parseable entries."""
+    fallback = _extract_urls_from_refined_section(refined_text)
+    merged = _dedupe_url_entries(llm_entries + fallback)
+    llm_ok = sum(1 for e in llm_entries if _parse_url_entry(e))
+    if llm_entries and llm_ok < max(3, len(llm_entries) // 2):
+        print(
+            f"PROGRESS: Phase 2.6 — Flash returned {len(llm_entries)} lines but only "
+            f"{llm_ok} parseable; merged with {len(fallback)} regex fallback URL(s) "
+            f"→ {len(merged)} total.",
+            flush=True,
+        )
+    return merged
 
 
 def _refine_single_url(
@@ -200,15 +343,12 @@ def _refine_single_url(
     Every artifact is written *exclusively* into ``session_dir/agent_scrapes/``.
     """
     try:
-        url_match = re.search(r'\[(https?://[^\]]+)\]', entry)
-        title_match = re.search(r'^(.+?)\s*\[', entry)
-
-        if not url_match:
+        parsed = _parse_url_entry(entry)
+        if not parsed:
             logger.warning("Phase 2.6: Could not parse URL from entry: %s", entry)
             return
 
-        hv_url = url_match.group(1)
-        hv_title = title_match.group(1).strip() if title_match else f"Secondary_Crawl_{index}"
+        hv_title, hv_url = parsed
 
         clean_title = re.sub(r'[^\w\s-]', '', hv_title).strip().replace(' ', '_')
         if not clean_title:
@@ -328,10 +468,11 @@ def execute(idea: str, url: str) -> dict:
     social_md: str = ""
     wiki_md: str = ""
     academic_md: str = ""
+    academic_fulltext_artifacts: list = []
 
     with ThreadPoolExecutor(max_workers=_PHASE2_WORKERS, thread_name_prefix="phase2") as pool:
         future_social = pool.submit(search_social_threads, primary_keyword)
-        future_academic = pool.submit(search_academic_papers, primary_keyword)
+        future_academic = pool.submit(search_academic_papers, search_keywords)
         future_wiki = pool.submit(get_wiki_summary, primary_keyword)
 
         futures_map = {
@@ -347,7 +488,11 @@ def execute(idea: str, url: str) -> dict:
                 if label == "Social":
                     social_md = result
                 elif label == "Academic":
-                    academic_md = result
+                    if isinstance(result, AcademicSearchResult):
+                        academic_md = result.markdown
+                        academic_fulltext_artifacts = result.fulltext_artifacts
+                    else:
+                        academic_md = result or ""
                 else:
                     wiki_md = result
                 print(f"PROGRESS: Phase 2 — ✓ {label} scraper complete.", flush=True)
@@ -363,9 +508,36 @@ def execute(idea: str, url: str) -> dict:
     saved_files.append(str(path))
     current_run_files.append(path.resolve())
 
-    path = save_markdown("agent_scrapes", primary_keyword, academic_md, session_dir=session_dir)
-    saved_files.append(str(path))
-    current_run_files.append(path.resolve())
+    ensure_session_structure(session_dir)
+    academic_scrape_path = session_dir / "agent_scrapes" / "academic_scrape.md"
+    academic_scrape_path.write_text(
+        academic_md or "# No academic papers found.\n",
+        encoding="utf-8",
+    )
+    saved_files.append(str(academic_scrape_path))
+    current_run_files.append(academic_scrape_path.resolve())
+
+    if academic_fulltext_artifacts:
+        fulltext_ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        summaries_dir = session_dir / "processed_summaries"
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+        print(
+            f"PROGRESS: Phase 2.2 — saving {len(academic_fulltext_artifacts)} full-text "
+            f"papers to processed_summaries/ (DataRefiner bypass)...",
+            flush=True,
+        )
+        for artifact in academic_fulltext_artifacts:
+            safe_id = re.sub(r"[^\w.-]", "_", artifact.triage_id).strip("_")[:48]
+            fname = f"academic_fulltext_{safe_id}_{fulltext_ts}.md"
+            ft_path = summaries_dir / fname
+            ft_path.write_text(
+                format_fulltext_artifact_markdown(artifact),
+                encoding="utf-8",
+            )
+            resolved = ft_path.resolve()
+            saved_files.append(str(resolved))
+            current_run_files.append(resolved)
+            print(f"PROGRESS: Phase 2.2 — saved {fname}", flush=True)
 
     print("PROGRESS: Phase 2 — ✓ all scrapers complete.", flush=True)
 
@@ -511,8 +683,11 @@ def execute(idea: str, url: str) -> dict:
     graph_path_abs = session_dir / "graphify-out" / "graph.html"
     graph_json_abs = session_dir / "graphify-out" / "graph.json"
     graph_path_str: str | None = None
-    if graphify_error is None and graph_path_abs.is_file():
+    if graph_path_abs.is_file():
         graph_path_str = str(graph_path_abs.resolve())
+    elif graph_json_abs.is_file() and graphify_error:
+        # Partial salvage: graph.json without html still enables HistoryView graph reload.
+        graph_path_str = str(graph_json_abs.resolve())
 
     if graphify_error:
         print(f"PROGRESS: Phase 4 — ✗ graphify error: {graphify_error}", flush=True)
@@ -520,20 +695,13 @@ def execute(idea: str, url: str) -> dict:
         print("PROGRESS: Phase 4 — ✓ knowledge graph generated.", flush=True)
 
     # ── Phase 4.5: Academic Graph Topology Analysis ──────────────────────
-    if graphify_error is None:
-        academic_gap_analysis = analyze_graph_topology(
-            current_run_files=current_run_files,
-            graph_json_path=graph_json_abs if graph_json_abs.is_file() else None,
-        )
-    else:
-        academic_gap_analysis = {
-            "summary": "Academic gap analysis requires a successful knowledge graph.",
-            "structural_holes": [],
-            "high_degree_limitations": [],
-            "orphaned_solutions": [],
-            "source_files": [],
-            "error": graphify_error,
-        }
+    # Run even when Graphify fails or returns a sparse graph — corpus Map-Reduce
+    # still delivers value; topology falls back to document-derived nodes.
+    academic_gap_analysis = analyze_graph_topology(
+        current_run_files=current_run_files,
+        graph_json_path=graph_json_abs if graph_json_abs.is_file() else None,
+        graphify_error=graphify_error,
+    )
 
     # Persist gap analysis next to the graph for HistoryView re-rendering.
     try:
@@ -545,15 +713,25 @@ def execute(idea: str, url: str) -> dict:
     except Exception as e:
         logger.warning("Could not write academic_gap_analysis.json: %s", e)
 
-    if graphify_error is None:
+    gap_error = academic_gap_analysis.get("error")
+    if graphify_error is None and not gap_error:
         phase_label = "Phase 4.5 — Academic Gap Analysis Complete"
         message = "Research pipeline completed successfully."
-    else:
+    elif graphify_error and academic_gap_analysis.get("structural_holes"):
+        phase_label = "Phase 4.5 — Academic Gap Analysis Complete (degraded graph)"
+        message = (
+            "Research pipeline finished; knowledge graph was degraded or missing "
+            "but gap analysis completed using document topology fallback."
+        )
+    elif graphify_error:
         phase_label = "Phase 4 — Knowledge Graph failed"
         message = (
             "Research pipeline finished; knowledge graph was not generated. "
             f"{graphify_error}"
         )
+    else:
+        phase_label = "Phase 4.5 — Academic Gap Analysis Complete"
+        message = "Research pipeline completed with warnings."
 
     return {
         "status": "success",

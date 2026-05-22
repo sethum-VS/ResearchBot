@@ -137,6 +137,109 @@ def _graphify_token_budget() -> str:
     return os.getenv("GRAPHIFY_TOKEN_BUDGET", "8192").strip() or "8192"
 
 
+_MIN_GRAPHIFY_NODES = 1
+_GRAPHIFY_EXTRACT_ATTEMPTS = 2
+
+
+def _graph_json_node_count(graph_path: Path) -> int:
+    if not graph_path.is_file():
+        return 0
+    try:
+        data = json.loads(graph_path.read_text(encoding="utf-8"))
+        return len(data.get("nodes") or [])
+    except (json.JSONDecodeError, OSError):
+        return 0
+
+
+def _run_graphify_extract(
+    filtered_dir: Path,
+    cwd: str,
+    env: dict,
+) -> subprocess.CompletedProcess[str]:
+    """
+    Run graphify extract with retry on failure or degenerate (sparse) graphs.
+    """
+    try:
+        primary_budget = int(_graphify_token_budget())
+    except ValueError:
+        primary_budget = 8192
+    budgets = [
+        primary_budget,
+        min(primary_budget * 2, 16384),
+    ][: _GRAPHIFY_EXTRACT_ATTEMPTS]
+
+    graph_path = filtered_dir / "graphify-out" / "graph.json"
+    last_error = "graphify extract failed"
+
+    for attempt, budget in enumerate(budgets, start=1):
+        if attempt > 1:
+            print(
+                f"PROGRESS: Phase 4 — retrying graphify extract (attempt {attempt}, "
+                f"token-budget={budget})...",
+                flush=True,
+            )
+        result = subprocess.run(
+            [
+                "graphify", "extract", str(filtered_dir),
+                "--backend", "ollama",
+                "--model", "llama-4-scout",
+                "--token-budget", str(budget),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=cwd,
+            timeout=1800,
+            env=env,
+        )
+        nodes = _graph_json_node_count(graph_path)
+        err_body = "\n".join(
+            part.strip()
+            for part in (result.stderr, result.stdout)
+            if part and part.strip()
+        ).strip()
+
+        if result.returncode == 0 and nodes >= _MIN_GRAPHIFY_NODES:
+            if attempt > 1:
+                print(
+                    f"PROGRESS: Phase 4 — graphify extract recovered "
+                    f"({nodes} nodes on attempt {attempt}).",
+                    flush=True,
+                )
+            return result
+
+        if nodes > 0 and nodes < _MIN_GRAPHIFY_NODES:
+            last_error = (
+                f"sparse graph ({nodes} nodes, need ≥{_MIN_GRAPHIFY_NODES}). "
+                f"{err_body}"
+            )
+        else:
+            last_error = err_body or f"graphify extract exit {result.returncode}"
+
+        logger.warning(
+            "Graphify extract attempt %d/%d failed: %s",
+            attempt,
+            len(budgets),
+            last_error[:500],
+        )
+
+    raise GraphifyError(1, last_error)
+
+
+def _promote_temp_graphify_out(filtered_dir: Path, session_dir: Path) -> bool:
+    """Move temp graphify-out into the session when extract partially succeeded."""
+    temp_out = filtered_dir / "graphify-out"
+    graph_path = temp_out / "graph.json"
+    if not graph_path.is_file():
+        return False
+
+    canonical_out = session_dir / "graphify-out"
+    if canonical_out.exists():
+        shutil.rmtree(canonical_out)
+    shutil.move(str(temp_out), str(canonical_out))
+    logger.info("Salvaged partial graphify-out to %s", canonical_out)
+    return True
+
+
 def _raw_node_ids_from_html(html: str) -> set[str]:
     """Parse vis-network RAW_NODES ids embedded in graph.html."""
     match = re.search(r"const RAW_NODES = (\[.*?\]);", html, re.DOTALL)
@@ -532,23 +635,10 @@ def run_graphify(
     env = _graphify_env()
     cwd = str(session_dir)  # run from the session root
 
+    extract_stdout = ""
     try:
-        result_extract = subprocess.run(
-            [
-                "graphify", "extract", str(filtered_dir),
-                "--backend", "ollama",
-                "--model", "llama-4-scout",
-                "--token-budget", _graphify_token_budget(),
-            ],
-            capture_output=True,
-            text=True,
-            cwd=cwd,
-            timeout=1800,
-            env=env,
-        )
-
-        if result_extract.returncode != 0:
-            raise GraphifyError(result_extract.returncode, result_extract.stderr.strip())
+        result_extract = _run_graphify_extract(filtered_dir, cwd, env)
+        extract_stdout = result_extract.stdout or ""
 
         result_viz = subprocess.run(
             ["graphify", "cluster-only", str(filtered_dir)],
@@ -561,6 +651,17 @@ def run_graphify(
 
         if result_viz.returncode != 0:
             raise GraphifyError(result_viz.returncode, result_viz.stderr.strip())
+
+    except GraphifyError as e:
+        salvaged = _promote_temp_graphify_out(filtered_dir, session_dir)
+        if salvaged:
+            print(
+                "PROGRESS: Phase 4 — salvaged partial graphify-out for UI/history.",
+                flush=True,
+            )
+            _regenerate_graph_html(session_dir / "graphify-out")
+        shutil.rmtree(filtered_dir, ignore_errors=True)
+        raise e
 
     except subprocess.TimeoutExpired as e:
         shutil.rmtree(filtered_dir, ignore_errors=True)
@@ -588,7 +689,7 @@ def run_graphify(
     except Exception as e:
         logger.warning("Post-processing completed with warnings: %s", e)
 
-    return result_extract.stdout + "\n" + result_viz.stdout
+    return extract_stdout + "\n" + result_viz.stdout
 
 
 # ── Interactive Console: query / path subprocesses ──────────────────────────

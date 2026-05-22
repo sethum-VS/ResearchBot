@@ -1,6 +1,6 @@
 #!/bin/bash
 # Ensures VertexProxy (FastAPI) is listening on port 8000 for Graph Terminal HTTP calls.
-# Safe to call repeatedly — no-op when already running.
+# Restarts any existing listener so pipeline runs always pick up latest VertexProxy.py.
 
 set -e
 
@@ -8,7 +8,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR/Backend"
 
 if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null 2>&1; then
-    exit 0
+    echo "Restarting VertexProxy to load latest proxy code…" >&2
+    pkill -f "uvicorn infrastructure.VertexProxy:app" 2>/dev/null || true
+    sleep 1
 fi
 
 if [ ! -d "$BACKEND_DIR/.venv" ]; then

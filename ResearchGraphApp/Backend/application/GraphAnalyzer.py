@@ -28,6 +28,7 @@ from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
 from infrastructure.FileStorage import get_session_dir_from_env
+from infrastructure.TextChunker import extract_academic_bookends
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +56,25 @@ _SUMMARY_REGION_PLAN: list[str] = ["global", "us-central1", "europe-west4", "us-
 
 _ANALYSIS_MODEL = "gemini-2.5-pro"
 
-_MAX_CHARS_PER_FILE = 120_000
-# Keep map prompts under Gemini's per-request limit (topology + corpus).
-_MAX_TOTAL_CORPUS_CHARS = 240_000
+# Phase 4.5 corpus must mirror Graphify inputs (no raw_ingestion).
+_ALLOWED_CORPUS_PARENTS = frozenset({"processed_summaries", "agent_scrapes"})
+
+# Per-file semantic chunking threshold (see TextChunker.extract_academic_bookends).
+_LARGE_FILE_THRESHOLD = 60_000
+
+# Graphify graphs with fewer nodes get a document-derived topology fallback.
+_MIN_GRAPH_NODES = 2
+
+# Keep map prompts under Gemini's per-request input limit (topology + system + corpus).
+# ~180k chars leaves headroom for full topology + prompts under 65k tokens.
+_MAX_TOTAL_CORPUS_CHARS = 180_000
+
+# Dynamic corpus allocation — protected buckets (Phase 4.5).
+_SYNTHESIS_BUDGET = 40_000
+_WEB_SCRAPE_BUDGET = 80_000
+_ACADEMIC_BUDGET = 120_000
+
+_CorpusEntry = tuple[Path, str, str]  # path, filename, delimited block
 
 _SHARED_CONTEXT = """You are an Academic Graph Analyzer helping university students discover Final Year Project (FYP) research gaps.
 
@@ -280,6 +297,131 @@ def _build_topology_summary(graph_data: dict) -> str:
     return "\n".join(parts)
 
 
+def _bucket_from_filename(name: str) -> str:
+    """Infer corpus bucket from a source filename (basename only)."""
+    lower = name.lower()
+    if lower.startswith("academic_fulltext_"):
+        return "academic"
+    if "_urlrefiner" in lower or lower == "academic_scrape.md":
+        return "web"
+    return "synthesis"
+
+
+def _build_document_fallback_graph(filenames: list[str]) -> dict[str, Any]:
+    """
+    Synthetic topology when Graphify fails or returns a degenerate graph.
+    One node per source filename; light same-bucket edges for Map-Reduce context.
+    """
+    nodes: list[dict[str, Any]] = []
+    links: list[dict[str, Any]] = []
+    by_bucket: dict[str, list[str]] = defaultdict(list)
+
+    for name in filenames[:40]:
+        stem = Path(name).stem.replace("_", " ")[:72]
+        node_id = re.sub(r"[^\w.-]", "_", name)
+        bucket = _bucket_from_filename(name)
+
+        nodes.append({
+            "id": node_id,
+            "label": stem or name,
+            "community": {"synthesis": 0, "web": 1, "academic": 2}.get(bucket, 3),
+            "community_name": f"{bucket.title()} Sources",
+            "type": "document",
+            "degree": 0,
+        })
+        by_bucket[bucket].append(node_id)
+
+    for bucket_ids in by_bucket.values():
+        for i in range(len(bucket_ids) - 1):
+            links.append({
+                "source": bucket_ids[i],
+                "target": bucket_ids[i + 1],
+                "type": "same_bucket",
+            })
+
+    for n in nodes:
+        n["degree"] = sum(
+            1 for link in links
+            if link["source"] == n["id"] or link["target"] == n["id"]
+        )
+
+    return {
+        "directed": False,
+        "multigraph": False,
+        "graph": {"fallback": True},
+        "nodes": nodes,
+        "links": links,
+        "hyperedges": [],
+    }
+
+
+def _list_eligible_corpus_paths(
+    current_run_files: Iterable[Path],
+) -> list[Path]:
+    """List corpus paths without reading file bodies (for fallback topology only)."""
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for raw_path in current_run_files or []:
+        try:
+            p = Path(raw_path).resolve()
+        except (TypeError, OSError, ValueError):
+            continue
+        if p in seen or not p.is_file() or p.suffix.lower() != ".md":
+            continue
+        if p.parent.name not in _ALLOWED_CORPUS_PARENTS:
+            continue
+        seen.add(p)
+        paths.append(p)
+    return paths
+
+
+def _resolve_graph_data(
+    graph_json_path: Path | None,
+    graphify_error: str | None,
+    current_run_files: Iterable[Path],
+) -> tuple[dict[str, Any], str | None]:
+    """
+    Load graph.json or build document fallback when missing / sparse / Graphify failed.
+    Returns (graph_data, warning_message).
+    """
+    warning: str | None = graphify_error
+    graph_data: dict[str, Any] = {"nodes": [], "links": []}
+
+    if graph_json_path is not None and graph_json_path.is_file():
+        try:
+            graph_data = json.loads(graph_json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            warning = f"Invalid graph.json: {e}"
+            graph_data = {"nodes": [], "links": []}
+
+    node_count = len(graph_data.get("nodes") or [])
+    if node_count >= _MIN_GRAPH_NODES:
+        if graphify_error:
+            return graph_data, f"Degraded graph ({node_count} nodes): {graphify_error}"
+        return graph_data, None
+
+    if node_count > 0 and node_count < _MIN_GRAPH_NODES:
+        warning = (
+            f"Sparse graph ({node_count} node(s)); using document topology fallback."
+        )
+    elif graphify_error:
+        warning = f"Graphify failed ({graphify_error}); using document topology fallback."
+
+    corpus_paths = _list_eligible_corpus_paths(current_run_files)
+    filenames = [p.name for p in corpus_paths]
+    if not filenames:
+        return graph_data, warning or "No source documents for fallback topology."
+
+    fallback = _build_document_fallback_graph(filenames)
+    print(
+        f"PROGRESS: Phase 4.5 — document topology fallback: "
+        f"{len(fallback['nodes'])} nodes, {len(fallback['links'])} edges "
+        f"from {len(filenames)} source file(s).",
+        flush=True,
+    )
+    return fallback, warning
+
+
 def _topology_stats_line(graph_data: dict) -> str:
     return (
         f"{len(graph_data.get('nodes', []))} nodes, "
@@ -298,70 +440,230 @@ def _read_single_markdown(raw_path: Path) -> tuple[str, str] | None:
         return None
     if not text.strip():
         return None
-    if len(text) > _MAX_CHARS_PER_FILE:
-        # Tail-trim: keep the end of long docs (limitations, URLs, conclusions).
-        text = (
-            "[... leading content truncated for context window ...]\n\n"
-            + text[-_MAX_CHARS_PER_FILE:]
+    if len(text) > _LARGE_FILE_THRESHOLD:
+        original_len = len(text)
+        text = extract_academic_bookends(text, max_chars=_LARGE_FILE_THRESHOLD)
+        bucket = _classify_corpus_bucket(raw_path) or "corpus"
+        print(
+            f"PROGRESS: Phase 4.5 — intelligently chunking large {bucket} file "
+            f"{raw_path.name} ({original_len:,} → {len(text):,} chars).",
+            flush=True,
         )
     block = f"<<<FILE: {raw_path.name}>>>\n{text}\n<<<END FILE: {raw_path.name}>>>"
     return raw_path.name, block
 
 
-def _corpus_priority(path: Path) -> int:
-    """Lower = included first when corpus budget is tight."""
+def _classify_corpus_bucket(path: Path) -> str | None:
+    """Return synthesis | web | academic, or None if not a corpus file."""
     parent = path.parent.name
     name = path.name.lower()
     if parent == "processed_summaries":
-        return 0
-    if "_urlrefiner" in name:
-        return 1
+        if name.startswith("academic_fulltext_"):
+            return "academic"
+        return "synthesis"
     if parent == "agent_scrapes":
+        return "web"
+    return None
+
+
+def _synthesis_sort_key(path: Path) -> tuple[float, str]:
+    try:
+        return (-path.stat().st_mtime, path.name)
+    except OSError:
+        return (0.0, path.name)
+
+
+def _web_scrape_sort_key(path: Path) -> tuple[int, float, str]:
+    """URLRefiner first, then other agent_scrapes; newest first within each tier."""
+    url_tier = 0 if "_urlrefiner" in path.name.lower() else 1
+    try:
+        mtime = -path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (url_tier, mtime, path.name)
+
+
+def _academic_sort_key(path: Path) -> tuple[float, str]:
+    try:
+        return (-path.stat().st_mtime, path.name)
+    except OSError:
+        return (0.0, path.name)
+
+
+def _pack_bucket(
+    entries: list[_CorpusEntry],
+    budget: int,
+) -> tuple[list[_CorpusEntry], int, int]:
+    """Include whole delimited files only; skip any that exceed remaining budget."""
+    included: list[_CorpusEntry] = []
+    used = 0
+    skipped = 0
+    for entry in entries:
+        block_len = len(entry[2])
+        if used + block_len <= budget:
+            included.append(entry)
+            used += block_len
+        else:
+            skipped += 1
+    return included, used, skipped
+
+
+def _trim_priority(path: Path) -> int:
+    """Lower value = dropped first by the global 240k safety net."""
+    bucket = _classify_corpus_bucket(path)
+    name = path.name.lower()
+    if bucket == "web":
+        return 0 if "_urlrefiner" not in name else 1
+    if bucket == "academic":
         return 2
-    if parent == "raw_ingestion":
+    if bucket == "synthesis":
         return 3
-    return 4
+    return 0
 
 
-def _apply_total_corpus_budget(
-    entries: list[tuple[Path, str, str]],
-) -> tuple[str, list[str], int]:
-    """
-    Concatenate file blocks in priority order without exceeding
-    _MAX_TOTAL_CORPUS_CHARS (map prompts must fit model input limits).
-    """
-    ordered = sorted(entries, key=lambda e: _corpus_priority(e[0]))
-    blocks: list[str] = []
-    filenames: list[str] = []
-    total = 0
-    omitted = 0
+def _apply_global_corpus_safety_net(
+    included: list[_CorpusEntry],
+) -> tuple[list[_CorpusEntry], int]:
+    """Drop whole files (lowest priority first) if bucket totals exceed 240k."""
+    total = sum(len(entry[2]) for entry in included)
+    if total <= _MAX_TOTAL_CORPUS_CHARS:
+        return included, 0
 
-    for _path, name, block in ordered:
-        if total + len(block) <= _MAX_TOTAL_CORPUS_CHARS:
-            blocks.append(block)
-            filenames.append(name)
-            total += len(block)
-            continue
+    drop_order = sorted(
+        range(len(included)),
+        key=lambda i: (_trim_priority(included[i][0]), -i),
+    )
+    dropped: set[int] = set()
+    for idx in drop_order:
+        if total <= _MAX_TOTAL_CORPUS_CHARS:
+            break
+        total -= len(included[idx][2])
+        dropped.add(idx)
 
-        remaining = _MAX_TOTAL_CORPUS_CHARS - total
-        if remaining > 2000:
-            trimmed = (
-                block[:remaining]
-                + f"\n\n[... FILE {name} truncated to fit corpus budget ...]"
-            )
-            blocks.append(trimmed)
-            filenames.append(name)
-            total += len(trimmed)
-        omitted += 1
-
-    if omitted:
+    if dropped:
         print(
-            f"PROGRESS: Phase 4.5 — corpus budget: included {len(filenames)} files "
-            f"({total:,} chars), omitted {omitted} lower-priority file(s).",
+            f"PROGRESS: Phase 4.5 — global corpus safety net: dropped {len(dropped)} "
+            f"file(s) to stay within {_MAX_TOTAL_CORPUS_CHARS:,} chars.",
             flush=True,
         )
 
-    return "\n\n".join(blocks), filenames, omitted
+    surviving = [entry for i, entry in enumerate(included) if i not in dropped]
+    return surviving, len(dropped)
+
+
+def _apply_dynamic_corpus_allocation(
+    entries: list[_CorpusEntry],
+) -> tuple[str, list[str], int]:
+    """
+    Pack SOURCE DOCUMENTS into protected synthesis / web / academic buckets,
+    apply synthesis rollover (academic first, then web), then enforce 240k cap.
+    """
+    synthesis_entries: list[_CorpusEntry] = []
+    web_entries: list[_CorpusEntry] = []
+    academic_entries: list[_CorpusEntry] = []
+
+    for entry in entries:
+        bucket = _classify_corpus_bucket(entry[0])
+        if bucket == "synthesis":
+            synthesis_entries.append(entry)
+        elif bucket == "web":
+            web_entries.append(entry)
+        elif bucket == "academic":
+            academic_entries.append(entry)
+
+    synthesis_entries.sort(key=lambda e: _synthesis_sort_key(e[0]))
+    web_entries.sort(key=lambda e: _web_scrape_sort_key(e[0]))
+    academic_entries.sort(key=lambda e: _academic_sort_key(e[0]))
+
+    syn_inc, syn_used, syn_skip = _pack_bucket(synthesis_entries, _SYNTHESIS_BUDGET)
+    synthesis_spare = _SYNTHESIS_BUDGET - syn_used
+
+    # Rollover: spare → academic cap first, then any unused spare → web cap.
+    academic_cap = _ACADEMIC_BUDGET + synthesis_spare
+    acad_inc, acad_used, acad_skip = _pack_bucket(academic_entries, academic_cap)
+    bonus_consumed = min(synthesis_spare, max(0, acad_used - _ACADEMIC_BUDGET))
+    web_cap = _WEB_SCRAPE_BUDGET + (synthesis_spare - bonus_consumed)
+    web_inc, web_used, web_skip = _pack_bucket(web_entries, web_cap)
+    # SOURCE DOCUMENTS block order: synthesis → web → academic (load narrative).
+
+    if synthesis_spare > 0:
+        rollover_parts = [
+            f"{synthesis_spare:,} chars synthesis spare → academic "
+            f"(+{synthesis_spare:,} cap)"
+        ]
+        web_rollover = synthesis_spare - bonus_consumed
+        if web_rollover > 0:
+            rollover_parts.append(
+                f"{web_rollover:,} chars → web (+{web_rollover:,} cap)"
+            )
+        print(
+            f"PROGRESS: Phase 4.5 — corpus rollover: {'; '.join(rollover_parts)}.",
+            flush=True,
+        )
+
+    def _bucket_line(
+        label: str,
+        included: list[_CorpusEntry],
+        used: int,
+        cap: int,
+        eligible: int,
+        skipped: int,
+    ) -> str:
+        return (
+            f"{label} {len(included)}/{eligible} file(s) "
+            f"({used:,}/{cap:,} chars"
+            + (f", {skipped} skipped" if skipped else "")
+            + ")"
+        )
+
+    print(
+        "PROGRESS: Phase 4.5 — dynamic corpus: "
+        + _bucket_line(
+            "synthesis",
+            syn_inc,
+            syn_used,
+            _SYNTHESIS_BUDGET,
+            len(synthesis_entries),
+            syn_skip,
+        )
+        + "; "
+        + _bucket_line(
+            "web",
+            web_inc,
+            web_used,
+            web_cap,
+            len(web_entries),
+            web_skip,
+        )
+        + "; "
+        + _bucket_line(
+            "academic",
+            acad_inc,
+            acad_used,
+            academic_cap,
+            len(academic_entries),
+            acad_skip,
+        )
+        + ".",
+        flush=True,
+    )
+
+    all_inc = syn_inc + web_inc + acad_inc
+    all_inc, safety_dropped = _apply_global_corpus_safety_net(all_inc)
+
+    blocks = [entry[2] for entry in all_inc]
+    filenames = [entry[1] for entry in all_inc]
+    total_chars = sum(len(b) for b in blocks)
+    bucket_omitted = syn_skip + web_skip + acad_skip + safety_dropped
+
+    if bucket_omitted and not safety_dropped:
+        print(
+            f"PROGRESS: Phase 4.5 — corpus buckets: omitted {bucket_omitted} "
+            f"whole file(s) that exceeded bucket caps.",
+            flush=True,
+        )
+
+    return "\n\n".join(blocks), filenames, bucket_omitted
 
 
 async def _load_source_corpus_async(
@@ -373,6 +675,7 @@ async def _load_source_corpus_async(
     """
     paths: list[Path] = []
     seen: set[Path] = set()
+    skipped_non_graphify = 0
     for raw_path in current_run_files or []:
         try:
             p = Path(raw_path).resolve()
@@ -382,8 +685,19 @@ async def _load_source_corpus_async(
             continue
         if not p.is_file() or p.suffix.lower() != ".md":
             continue
+        if p.parent.name not in _ALLOWED_CORPUS_PARENTS:
+            skipped_non_graphify += 1
+            continue
         seen.add(p)
         paths.append(p)
+
+    if skipped_non_graphify:
+        print(
+            f"PROGRESS: Phase 4.5 — corpus aligned with Graphify: skipped "
+            f"{skipped_non_graphify} file(s) outside processed_summaries/ "
+            f"and agent_scrapes/ (e.g. raw_ingestion/).",
+            flush=True,
+        )
 
     if not paths:
         return "(no source documents available for this run)", []
@@ -406,11 +720,11 @@ async def _load_source_corpus_async(
     if not entries:
         return "(no source documents available for this run)", []
 
-    corpus, filenames, _ = _apply_total_corpus_budget(entries)
+    corpus, filenames, _ = _apply_dynamic_corpus_allocation(entries)
 
     print(
         f"PROGRESS: Phase 4.5 — loaded {len(filenames)} source files "
-        f"({len(corpus):,} chars, async I/O).",
+        f"({len(corpus):,} chars, async I/O, dynamic buckets).",
         flush=True,
     )
     return corpus, filenames
@@ -783,12 +1097,14 @@ async def _run_map_reduce_analysis_async(
 def analyze_graph_topology(
     current_run_files: Iterable[Path] | None = None,
     graph_json_path: Path | None = None,
+    graphify_error: str | None = None,
 ) -> dict[str, Any]:
     """
     Phase 4.5 entry point (sync wrapper around asyncio Map-Reduce).
 
     Returns academic_gap_analysis payload for Swift bridging.
     """
+    path: Path | None
     if graph_json_path is not None:
         path = Path(graph_json_path)
     else:
@@ -799,29 +1115,28 @@ def analyze_graph_topology(
             )
         path = session_dir / "graphify-out" / "graph.json"
 
-    if not path.is_file():
-        msg = f"graph.json not found at {path}"
-        logger.warning(msg)
-        print(f"PROGRESS: Phase 4.5 — ⚠ {msg}", flush=True)
-        return _empty_analysis(msg)
-
-    try:
-        graph_data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        return _empty_analysis(f"Invalid graph.json: {e}")
-
-    if not graph_data.get("nodes"):
-        return _empty_analysis("graph.json contains no nodes.")
+    if path is not None and not path.is_file():
+        path = None
 
     print(
         "PROGRESS: Phase 4.5 — analyzing graph topology + source corpus (Map-Reduce)...",
         flush=True,
     )
 
+    graph_data, topology_warning = _resolve_graph_data(
+        path, graphify_error, current_run_files or []
+    )
+    if not graph_data.get("nodes"):
+        msg = topology_warning or "graph.json contains no nodes."
+        print(f"PROGRESS: Phase 4.5 — ⚠ {msg}", flush=True)
+        return _empty_analysis(msg)
+
     try:
         result = asyncio.run(
             _run_map_reduce_analysis_async(graph_data, current_run_files or [])
         )
+        if topology_warning:
+            result["error"] = topology_warning
         print("PROGRESS: Phase 4.5 — ✓ academic gap analysis complete.", flush=True)
         return result
     except Exception as e:
