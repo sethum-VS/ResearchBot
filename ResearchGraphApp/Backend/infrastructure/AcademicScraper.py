@@ -13,12 +13,15 @@ extraction → artifacts returned for direct injection into processed_summaries/
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
@@ -55,7 +58,13 @@ TAVILY_PER_KEYWORD_LIMIT = 5
 KEYWORD_SLICE = 3
 _PDF_EXTRACT_WORKERS = 5
 _FULLTEXT_TARGET = 5
+_FULLTEXT_MAX_PDF_ATTEMPTS = _FULLTEXT_TARGET + 3
 _TRIAGE_MODEL = "gemini-2.5-flash"
+
+_S2_PAPER_URL_RE = re.compile(
+    r"https?://(?:www\.)?semanticscholar\.org/paper/([0-9a-fA-F]{38,40})\b",
+    re.IGNORECASE,
+)
 
 _STABLE_REGIONS: list[str] = [
     "europe-west4",
@@ -136,6 +145,57 @@ def _paper_triage_id(paper: AcademicPaper) -> str:
     return f"title:{_normalize_title(paper.title)}"
 
 
+def _best_s2_paper_id_match(corrupt_id: str, known_ids: set[str]) -> str | None:
+    """Map a typo'd paperId to a known id from Phase 2 metadata (length-safe fuzzy match)."""
+    corrupt = corrupt_id.lower()
+    if corrupt in known_ids:
+        return corrupt
+    matches = difflib.get_close_matches(corrupt, list(known_ids), n=1, cutoff=0.92)
+    return matches[0] if matches else None
+
+
+def normalize_semanticscholar_crawl_url(
+    url: str,
+    known_paper_ids: set[str] | None = None,
+) -> str | None:
+    """
+    Validate or repair semanticscholar.org/paper/{id} URLs before Firecrawl.
+    Returns None when the id cannot be normalized (skip crawl).
+    """
+    url = (url or "").strip()
+    match = _S2_PAPER_URL_RE.search(url)
+    if not match:
+        return url
+    raw_id = match.group(1).lower()
+    paper_id = raw_id
+    if known_paper_ids:
+        if raw_id in known_paper_ids:
+            paper_id = raw_id
+        else:
+            fixed = _best_s2_paper_id_match(raw_id, known_paper_ids)
+            if fixed:
+                paper_id = fixed
+                logger.info(
+                    "Repaired Semantic Scholar crawl URL paper id %s → %s",
+                    raw_id[:12] + "...",
+                    fixed[:12] + "...",
+                )
+            else:
+                logger.info(
+                    "Skipping unknown Semantic Scholar paper URL: %s",
+                    url[:120],
+                )
+                return None
+    elif not re.fullmatch(r"[0-9a-f]{40}", raw_id):
+        return None
+    return url[: match.start(1)] + paper_id + url[match.end(1) :]
+
+
+def s2_paper_ids_from_academic_markdown(markdown: str) -> set[str]:
+    """Extract s2:{paperId} values from academic_scrape.md for URL repair in Phase 2.6."""
+    return {pid.lower() for pid in re.findall(r"s2:([0-9a-f]{40})", markdown or "", re.IGNORECASE)}
+
+
 def _extract_arxiv_id(url: str) -> str | None:
     if not url:
         return None
@@ -212,6 +272,10 @@ def _assign_triage_ids(papers: list[AcademicPaper]) -> None:
         paper.triage_id = _paper_triage_id(paper)
 
 
+def _has_s2_api_key() -> bool:
+    return bool(os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip())
+
+
 def _s2_headers() -> dict[str, str]:
     headers = {"User-Agent": S2_USER_AGENT}
     api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip()
@@ -220,10 +284,66 @@ def _s2_headers() -> dict[str, str]:
     return headers
 
 
-def _is_retryable_http_error(exc: BaseException) -> bool:
-    if isinstance(exc, requests.HTTPError) and exc.response is not None:
-        return exc.response.status_code in (429, 500, 502, 503, 504)
-    return False
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _parse_retry_after(response: requests.Response) -> float:
+    header = (response.headers.get("Retry-After") or "").strip()
+    if not header:
+        return 0.0
+    try:
+        return max(0.0, float(header))
+    except ValueError:
+        pass
+    try:
+        retry_dt = parsedate_to_datetime(header)
+        if retry_dt.tzinfo is None:
+            retry_dt = retry_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max(0.0, (retry_dt - now).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def _s2_default_429_wait_sec() -> float:
+    return 3.0 if _has_s2_api_key() else 10.0
+
+
+def _s2_post_429_cooldown_sec() -> float:
+    explicit = os.getenv("S2_POST_429_COOLDOWN_SEC", "").strip()
+    if explicit:
+        return _env_float("S2_POST_429_COOLDOWN_SEC", 15.0)
+    return 5.0 if _has_s2_api_key() else 15.0
+
+
+def _s2_429_max_retries() -> int:
+    return _env_int("S2_429_MAX_RETRIES", 2)
+
+
+def _s2_circuit_breaker_enabled() -> bool:
+    return _env_bool("S2_CIRCUIT_BREAKER", True)
+
+
+def _s2_keyword_delay_sec() -> float:
+    return _env_float("S2_KEYWORD_DELAY_SEC", 3.0)
 
 
 def _is_resource_exhausted(exc: Exception) -> bool:
@@ -231,25 +351,44 @@ def _is_resource_exhausted(exc: Exception) -> bool:
     return "429" in exc_str or "resourceexhausted" in exc_str or "resource_exhausted" in exc_str
 
 
-@retry(
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=3, min=5, max=60),
-    retry=retry_if_exception(_is_retryable_http_error),
-    reraise=True,
-)
-def _s2_search_request(query: str, limit: int) -> dict[str, Any]:
-    response = requests.get(
-        f"{S2_BASE_URL}{S2_SEARCH_PATH}",
-        params={
-            "query": query,
-            "limit": limit,
-            "fields": S2_FIELDS,
-        },
-        headers=_s2_headers(),
-        timeout=S2_TIMEOUT_SEC,
-    )
-    response.raise_for_status()
-    return response.json()
+def _s2_search_request(keyword: str, limit: int) -> dict[str, Any]:
+    """Single-keyword S2 search with Retry-After-aware 429 backoff (arXiv-style)."""
+    url = f"{S2_BASE_URL}{S2_SEARCH_PATH}"
+    params_base = {"limit": limit, "fields": S2_FIELDS}
+    queries = [_enhanced_query(keyword), keyword]
+    query_idx = 0
+    max_429_retries = _s2_429_max_retries()
+    server_error_retries = 0
+
+    for attempt in range(max_429_retries + 1):
+        params = {**params_base, "query": queries[query_idx]}
+        response = requests.get(
+            url,
+            params=params,
+            headers=_s2_headers(),
+            timeout=S2_TIMEOUT_SEC,
+        )
+
+        if response.status_code == 429:
+            if attempt >= max_429_retries:
+                response.raise_for_status()
+            wait = _parse_retry_after(response) or _s2_default_429_wait_sec()
+            time.sleep(wait)
+            if attempt >= 1 and query_idx == 0:
+                query_idx = 1
+            continue
+
+        if response.status_code in (500, 502, 503, 504):
+            if server_error_retries < 1:
+                server_error_retries += 1
+                time.sleep(2.0)
+                continue
+            response.raise_for_status()
+
+        response.raise_for_status()
+        return response.json()
+
+    raise RuntimeError("Semantic Scholar search exhausted 429 retries")
 
 
 def _dedupe_s2_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -277,28 +416,86 @@ def _dedupe_s2_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _fetch_semantic_scholar_keywords(keywords: list[str]) -> list[AcademicPaper]:
     merged: list[dict[str, Any]] = []
-    has_api_key = bool(os.getenv("SEMANTIC_SCHOLAR_API_KEY", "").strip())
+    has_api_key = _has_s2_api_key()
     saw_429 = False
-    for idx, keyword in enumerate(_top_keywords(keywords)):
-        delay = _s2_keyword_delay_sec()
-        if idx > 0 and delay > 0:
-            time.sleep(delay)
+    circuit_open = False
+    top = _top_keywords(keywords)
+    total = len(top)
+
+    for idx, keyword in enumerate(top):
+        if circuit_open:
+            break
+        if idx > 0:
+            delay = _s2_keyword_delay_sec()
+            if delay > 0:
+                time.sleep(delay)
         try:
-            payload = _s2_search_request(_enhanced_query(keyword), S2_PER_KEYWORD_LIMIT)
-            merged.extend(payload.get("data") or [])
-        except Exception as exc:
-            exc_str = str(exc)
-            if "429" in exc_str:
-                saw_429 = True
-            logger.warning(
-                "Semantic Scholar search failed for keyword %r after retries: %s",
-                keyword,
-                exc,
+            payload = _s2_search_request(keyword, S2_PER_KEYWORD_LIMIT)
+            batch = payload.get("data") or []
+            count = len(batch)
+            merged.extend(batch)
+            print(
+                f"PROGRESS: Phase 2 — Semantic Scholar [{idx + 1}/{total}] "
+                f"ok ({count} papers).",
+                flush=True,
             )
-    if saw_429 and not has_api_key:
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status == 429:
+                saw_429 = True
+                cooldown = _s2_post_429_cooldown_sec()
+                if cooldown > 0:
+                    time.sleep(cooldown)
+                print(
+                    f"PROGRESS: Phase 2 — Semantic Scholar [{idx + 1}/{total}] "
+                    "rate-limited (429) after backoff.",
+                    flush=True,
+                )
+                if _s2_circuit_breaker_enabled():
+                    circuit_open = True
+                    remaining = total - idx - 1
+                    if remaining > 0:
+                        hint = (
+                            " Set SEMANTIC_SCHOLAR_API_KEY in .env for dedicated 1 RPS."
+                            if not has_api_key
+                            else ""
+                        )
+                        print(
+                            "PROGRESS: Phase 2 — Semantic Scholar circuit open — "
+                            f"skipping {remaining} remaining keyword(s). "
+                            "arXiv and Tavily will still supply academic metadata."
+                            f"{hint}",
+                            flush=True,
+                        )
+                logger.info(
+                    "Semantic Scholar rate-limited for keyword %r (429); continuing with other sources.",
+                    keyword,
+                )
+            else:
+                logger.warning(
+                    "Semantic Scholar search failed for keyword %r: %s",
+                    keyword,
+                    exc,
+                )
+        except Exception as exc:
+            if "429" in str(exc):
+                saw_429 = True
+                logger.info(
+                    "Semantic Scholar rate-limited for keyword %r; continuing with other sources.",
+                    keyword,
+                )
+            else:
+                logger.warning(
+                    "Semantic Scholar search failed for keyword %r: %s",
+                    keyword,
+                    exc,
+                )
+
+    if saw_429 and not has_api_key and not circuit_open:
         print(
             "PROGRESS: Phase 2 — Semantic Scholar rate-limited (429). "
-            "Set SEMANTIC_SCHOLAR_API_KEY in .env for higher quotas.",
+            "Set SEMANTIC_SCHOLAR_API_KEY in .env for dedicated 1 RPS. "
+            "arXiv and Tavily may still have filled academic_scrape.md.",
             flush=True,
         )
 
@@ -329,14 +526,6 @@ def _arxiv_delay_sec() -> float:
         return max(0.0, float(raw))
     except ValueError:
         return 3.0
-
-
-def _s2_keyword_delay_sec() -> float:
-    raw = os.getenv("S2_KEYWORD_DELAY_SEC", "4")
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return 4.0
 
 
 def _parse_arxiv_atom(xml_text: str) -> list[AcademicPaper]:
@@ -785,11 +974,11 @@ def _run_phase_22_fulltext(
         if pdf_url and pdf_url not in url_to_paper:
             url_to_paper[pdf_url] = paper
 
-    work = list(url_to_paper.items())
+    work = list(url_to_paper.items())[:_FULLTEXT_MAX_PDF_ATTEMPTS]
     target = _FULLTEXT_TARGET
     print(
         f"PROGRESS: Phase 2.2 — fetching full text for up to {target} papers "
-        f"({len(work)} unique PDFs, {_PDF_EXTRACT_WORKERS} workers)...",
+        f"({len(work)} PDF attempt(s) max, {_PDF_EXTRACT_WORKERS} workers)...",
         flush=True,
     )
 
@@ -805,6 +994,8 @@ def _run_phase_22_fulltext(
             for url, paper in work
         }
         for future in as_completed(future_to_url):
+            if len(artifacts) >= target:
+                break
             url = future_to_url[future]
             completed += 1
             try:
@@ -907,6 +1098,12 @@ def search_academic_papers(
 
     s2_papers, arxiv_papers, tavily_papers = _cross_source_dedup(
         s2_papers, arxiv_papers, tavily_papers,
+    )
+
+    print(
+        "PROGRESS: Phase 2 — Academic sources (after dedup): "
+        f"S2={len(s2_papers)}, arXiv={len(arxiv_papers)}, Tavily={len(tavily_papers)} papers.",
+        flush=True,
     )
 
     markdown = _merge_academic_markdown(

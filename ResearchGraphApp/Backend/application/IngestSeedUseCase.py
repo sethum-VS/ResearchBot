@@ -65,6 +65,8 @@ from infrastructure.WikiAPI import get_wiki_summary
 from infrastructure.AcademicScraper import (
     AcademicSearchResult,
     format_fulltext_artifact_markdown,
+    normalize_semanticscholar_crawl_url,
+    s2_paper_ids_from_academic_markdown,
     search_academic_papers,
 )
 from infrastructure.FileStorage import (
@@ -180,7 +182,10 @@ def _format_url_entry(title: str, url: str) -> str:
     return f"{title} [{url}]"
 
 
-def _dedupe_url_entries(entries: list[str]) -> list[str]:
+def _dedupe_url_entries(
+    entries: list[str],
+    s2_paper_ids: set[str] | None = None,
+) -> list[str]:
     """Keep first occurrence per URL; preserve Title [URL] format."""
     seen: set[str] = set()
     out: list[str] = []
@@ -189,6 +194,9 @@ def _dedupe_url_entries(entries: list[str]) -> list[str]:
         if not parsed:
             continue
         title, url = parsed
+        url = normalize_semanticscholar_crawl_url(url, s2_paper_ids) or ""
+        if not url:
+            continue
         key = url.rstrip("/").lower()
         if key in seen:
             continue
@@ -252,7 +260,10 @@ async def _call_flash_async(client: genai.Client, contents: str):
     )
 
 
-async def _extract_high_value_urls(refined_text: str) -> list[str]:
+async def _extract_high_value_urls(
+    refined_text: str,
+    s2_paper_ids: set[str] | None = None,
+) -> list[str]:
     """
     Extract high-value URLs for next crawl using Gemini 2.5 Flash.
     Global → STABLE_REGIONS failover, identical to DataRefiner pattern.
@@ -272,7 +283,7 @@ async def _extract_high_value_urls(refined_text: str) -> list[str]:
         client = genai.Client(vertexai=True, project=project_id, location="global")
         response = await _call_flash_async(client, contents)
         entries = _parse_url_extraction_response(response)
-        return _merge_high_value_url_entries(entries, refined_text)
+        return _merge_high_value_url_entries(entries, refined_text, s2_paper_ids)
     except Exception as primary_exc:
         print(
             f"PROGRESS: Phase 2.6 — global endpoint failed ({primary_exc}). "
@@ -288,7 +299,7 @@ async def _extract_high_value_urls(refined_text: str) -> list[str]:
             response = await _call_flash_async(client, contents)
             lines = _parse_url_extraction_response(response)
             if lines:
-                return _merge_high_value_url_entries(lines, refined_text)
+                return _merge_high_value_url_entries(lines, refined_text, s2_paper_ids)
         except Exception as region_exc:
             print(f"PROGRESS: Phase 2.6 — region {region} failed: {region_exc}", flush=True)
             last_exc = region_exc
@@ -305,17 +316,18 @@ async def _extract_high_value_urls(refined_text: str) -> list[str]:
             f"URL(s) from refined Markdown fallback.",
             flush=True,
         )
-        return _dedupe_url_entries(fallback)
+        return _dedupe_url_entries(fallback, s2_paper_ids)
     return []
 
 
 def _merge_high_value_url_entries(
     llm_entries: list[str],
     refined_text: str,
+    s2_paper_ids: set[str] | None = None,
 ) -> list[str]:
     """Combine Flash output with regex fallback; prefer parseable entries."""
     fallback = _extract_urls_from_refined_section(refined_text)
-    merged = _dedupe_url_entries(llm_entries + fallback)
+    merged = _dedupe_url_entries(llm_entries + fallback, s2_paper_ids)
     llm_ok = sum(1 for e in llm_entries if _parse_url_entry(e))
     if llm_entries and llm_ok < max(3, len(llm_entries) // 2):
         print(
@@ -580,7 +592,10 @@ def execute(idea: str, url: str) -> dict:
 
     # ── Phase 2.6: Recursive URL Extraction & Per-URL Refinement ─────────
     print("PROGRESS: Phase 2.6 — extracting high-value URLs...", flush=True)
-    high_value_urls = asyncio.run(_extract_high_value_urls(refined_data))
+    s2_paper_ids = s2_paper_ids_from_academic_markdown(academic_md)
+    high_value_urls = asyncio.run(
+        _extract_high_value_urls(refined_data, s2_paper_ids),
+    )
     print(
         f"PROGRESS: Phase 2.6 — found {len(high_value_urls)} URLs for concurrent crawling.",
         flush=True,

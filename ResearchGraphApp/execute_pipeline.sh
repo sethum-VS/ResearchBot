@@ -59,4 +59,5 @@ echo "✅ VertexProxy ready on port 8000."
 #   python3 main.py --idea "topic" [--url "..."]
 # Google Workspace export:
 #   python3 main.py --command export_to_workspace --session-id "session_..." --kb-root "/abs/path/research_knowledge_base"
-python3 main.py "$@"
+export PYTHONUNBUFFERED=1
+python3 -u main.py "$@"

@@ -93,7 +93,8 @@ cd "$SCRIPT_DIR"
 PIPELINE_LOG="$(mktemp)"
 set +e
 # Redirect to log (avoid tee pipe hang when the shell wrapper keeps stdout open).
-./execute_pipeline.sh --idea "AI Agents for Automated Code Review" >"$PIPELINE_LOG" 2>&1
+# Line-buffered pipeline stdout so the sandbox log updates during long runs.
+stdbuf -oL ./execute_pipeline.sh --idea "AI Agents for Automated Code Review" >"$PIPELINE_LOG" 2>&1
 PIPELINE_EXIT=$?
 set -e
 cat "$PIPELINE_LOG"

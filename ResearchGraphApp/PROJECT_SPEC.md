@@ -37,7 +37,7 @@ The workbench also provides **workspace run isolation** (every execution writes 
 ### Data Ingestion APIs
 
 * **Firecrawl** — Local Docker container for deep web crawling (`/crawl`, `/scrape`)
-* **Semantic Scholar API** — Academic Graph `/paper/search` (primary academic metadata in Phase 2); optional `SEMANTIC_SCHOLAR_API_KEY` via `x-api-key` header (keyless fallback with User-Agent)
+* **Semantic Scholar API** — Academic Graph `/paper/search` (primary academic metadata in Phase 2); optional `SEMANTIC_SCHOLAR_API_KEY` via `x-api-key` header (keyless shared pool with User-Agent). Rate-paced like arXiv: `Retry-After` on 429, bounded retries, circuit breaker; failures are non-fatal (arXiv + Tavily still run)
 * **arXiv API** — Atom export API (`export.arxiv.org`) for CS/FYP preprints; rate-paced multi-keyword queries
 * **Tavily API** — Social leads (Reddit/X); academic domain search on `arxiv.org`, `researchgate.net`, `scholar.google.com` (merged with S2 + arXiv in `AcademicScraper.py`)
 * **MediaWiki API** — Foundational definitions and Wiki context
@@ -120,7 +120,7 @@ SwiftUI (PythonBridge)
 execute_pipeline.sh [--idea "..."] [--url "..."]
     ├── Activates Backend/.venv
     ├── Starts VertexProxy (uvicorn :8000) if not running
-    └── python3 main.py [args]
+    └── PYTHONUNBUFFERED=1 python3 -u main.py [args]   # line-buffered PROGRESS for Swift / test_backend
             ├── Default: IngestSeedUseCase.execute()
             │       ├── FileStorage.create_session_dir(idea)  → RESEARCHBOT_SESSION_DIR
             │       └── stdout: PROGRESS lines + ---PIPELINE_RESULT_START--- JSON
@@ -166,11 +166,36 @@ Multi-keyword expansion uses the **top 3** unique `search_keywords` per source:
 
 | Source | Per keyword | Post-merge |
 |--------|-------------|------------|
-| **Semantic Scholar** | 10 papers (`/paper/search`) | Dedupe by `paperId` / normalized title |
+| **Semantic Scholar** | 10 papers (`/paper/search`) | Dedupe by `paperId` / normalized title; `S2_KEYWORD_DELAY_SEC` (default 3s) between keyword calls; 429 handling honors `Retry-After`, bounded retries (`S2_429_MAX_RETRIES`), optional circuit breaker (`S2_CIRCUIT_BREAKER`) skips remaining S2 keywords while arXiv/Tavily continue |
 | **arXiv** | 10 papers (Atom API) | Dedupe by arXiv ID; `ARXIV_REQUEST_DELAY_SEC` (default 3s) between keyword calls |
 | **Tavily** (academic domains) | 5 results | Dedupe by URL |
 
 **Cross-source deduplication:** arXiv and Tavily rows that match an existing S2 paper (arXiv ID or title) are dropped so the metadata scrape does not duplicate the same work.
+
+**Orchestration order (single Academic thread):** Semantic Scholar → arXiv → Tavily (sequential, not parallel across academic APIs). After merge and dedup, stdout reports `Academic sources (after dedup): S2=…, arXiv=…, Tavily=…`.
+
+#### Semantic Scholar rate-limit protocol (`AcademicScraper.py`)
+
+Mirrors arXiv pacing; does **not** use blind multi-retry loops on 429.
+
+| Step | Behavior |
+|------|----------|
+| **Keyword loop** | Top 3 keywords; `S2_KEYWORD_DELAY_SEC` (default 3s) before keywords 2 and 3 |
+| **Per-keyword request** | `_s2_search_request()` — enhanced query (`{keyword} research paper methodology findings`); on 2nd+ 429 retry, retries with **plain keyword only** |
+| **429 backoff** | Honor `Retry-After` header (seconds or HTTP-date); else default wait 10s keyless / 3s keyed; up to `S2_429_MAX_RETRIES` (default 2) per keyword |
+| **5xx** | At most one extra retry after 2s |
+| **Circuit breaker** | When `S2_CIRCUIT_BREAKER=true` (default), after 429 exhaustion on any keyword, skip remaining S2 keywords for the run; emit PROGRESS with optional API-key hint |
+| **Logging** | Expected 429s log at `info` (not `warning`); unrecoverable non-429 errors stay at `warning` |
+| **Partial success** | Papers from successful keywords are kept; arXiv and Tavily always run afterward |
+
+**Example PROGRESS (degraded keyless run):**
+
+```
+PROGRESS: Phase 2 — Semantic Scholar [1/3] ok (10 papers).
+PROGRESS: Phase 2 — Semantic Scholar [2/3] rate-limited (429) after backoff.
+PROGRESS: Phase 2 — Semantic Scholar circuit open — skipping 1 remaining keyword(s). arXiv and Tavily will still supply academic metadata. Set SEMANTIC_SCHOLAR_API_KEY in .env for dedicated 1 RPS.
+PROGRESS: Phase 2 — Academic sources (after dedup): S2=10, arXiv=26, Tavily=12 papers.
+```
 
 **Return type:** `AcademicSearchResult` dataclass:
 
@@ -193,8 +218,8 @@ Runs **after** metadata merge, **before** Phase 2.5. Full-text papers bypass `Da
 | **2. Pool cap** | Citation-sorted; max `ACADEMIC_TRIAGE_POOL_MAX` (default 25) sent to Flash |
 | **3. Triage** | `triage_top_papers()` — Gemini 2.5 Flash (`genai.Client`, global + `STABLE_REGIONS` failover) |
 | **Prompt contract** | Evaluate titles/abstracts vs keywords; **only** papers with `pdf_url`; return JSON array of exact `triage_id` strings (`s2:…`, `arxiv:…`, `url:…`) |
-| **4. Selection** | Up to 5 Flash picks; **backfill** from remaining OA pool if a download fails |
-| **5. Full PDF I/O** | `ThreadPoolExecutor` (`_PDF_EXTRACT_WORKERS = 5`); `PdfExtractor.extract_full_text_from_url` (all pages) |
+| **4. Selection** | Up to 5 Flash picks; **backfill** candidates from OA pool (up to `_FULLTEXT_TARGET + 3` unique PDF URLs, default 8 attempts) |
+| **5. Full PDF I/O** | `ThreadPoolExecutor` (`_PDF_EXTRACT_WORKERS = 5`); `PdfExtractor.extract_full_text_from_url` (all pages); stops after 5 successful extractions (does not download the entire backfill pool) |
 | **6. Persist** | Orchestrator writes `processed_summaries/academic_fulltext_{triage_id}_{timestamp}.md` |
 
 **Stdout examples:**
@@ -202,8 +227,9 @@ Runs **after** metadata merge, **before** Phase 2.5. Full-text papers bypass `Da
 ```
 PROGRESS: Phase 2.2 — triaging 22 OA candidates (max pool 25)...
 PROGRESS: Phase 2.2 — Flash selected 5 papers for full-text review.
-PROGRESS: Phase 2.2 — fetching full text for up to 5 papers (5 unique PDFs, 5 workers)...
-PROGRESS: Phase 2.2 — full-text [3/5] ok: https://arxiv.org/pdf/...
+PROGRESS: Phase 2.2 — fetching full text for up to 5 papers (8 PDF attempt(s) max, 5 workers)...
+PROGRESS: Phase 2.2 — full-text [3/8] ok: https://arxiv.org/pdf/...
+PROGRESS: Phase 2.2 — full-text complete (5/5 saved).
 PROGRESS: Phase 2.2 — saving 5 full-text papers to processed_summaries/ (DataRefiner bypass)...
 PROGRESS: Phase 2.2 — saved academic_fulltext_arxiv_1706_03762_20260522T120000.md
 ```
@@ -232,9 +258,10 @@ Both use `requests` with `timeout=(5, 15)` (connect 5s, read 15s), in-memory dow
 | Item | Detail |
 |------|--------|
 | **URL extraction** | Gemini 2.5 Flash parses Phase 2.5 output → `Title [URL]` lines |
+| **S2 URL hygiene** | Before crawl, `normalize_semanticscholar_crawl_url()` repairs `semanticscholar.org/paper/{id}` using `s2:{paperId}` ids from `academic_scrape.md` (`s2_paper_ids_from_academic_markdown`); unknown or unrepairable ids are dropped; typos matched via fuzzy match (`difflib`, cutoff 0.92) |
 | **Per-URL worker** | `deep_crawl_urls` → `refine_scraped_data` → `save_markdown(..., *_URLRefiner, session_dir=...)` |
 | **Concurrency** | `ThreadPoolExecutor`, `_PHASE26_MAX_WORKERS = 5`, `threading.Lock` on `current_run_files` |
-| **Anti-bot guard** | Skips payloads containing captcha / 403 / empty-scrape indicators |
+| **Anti-bot guard** | Skips payloads containing captcha / 403 / empty-scrape indicators (common on `semanticscholar.org` HTML pages) |
 | **Naming** | Files use `_URLRefiner` suffix for Phase 4 visibility and HistoryView metrics |
 
 ### Phase 3: Synthesis & Storage
@@ -686,7 +713,7 @@ MarkdownViewer
 Backend/
 ├── main.py                          # CLI entry; pipeline + export_to_workspace commands
 ├── application/
-│   ├── IngestSeedUseCase.py         # Orchestrator; create_session_dir; manifest + gap JSON persist
+│   ├── IngestSeedUseCase.py         # Orchestrator; Phase 2.6 URL dedupe + S2 paper URL repair; manifest + gap JSON
 │   ├── ExportWorkspaceUseCase.py    # export_to_workspace(session_id, kb_root)
 │   ├── InputAnalyzer.py             # Phase 1.5
 │   ├── DataRefiner.py               # Phase 2.5
@@ -700,7 +727,7 @@ Backend/
     ├── FileStorage.py               # Session dirs, save_markdown, RESEARCHBOT_SESSION_DIR
     ├── WebScraper.py                # Firecrawl
     ├── SocialScraper.py
-    ├── AcademicScraper.py           # Phase 2 metadata + Phase 2.2 triage/full-text
+    ├── AcademicScraper.py           # Phase 2 metadata (S2/arXiv/Tavily), S2 rate-limit + Phase 2.2 triage/full-text; S2 URL normalize helpers
     ├── PdfExtractor.py              # PyMuPDF partial + full-document extraction
     └── WikiAPI.py
 ```
@@ -709,10 +736,10 @@ Backend/
 
 | Script | Role |
 |--------|------|
-| `execute_pipeline.sh` | venv activate, VertexProxy lifecycle, `main.py "$@"` (pipeline or `export_to_workspace`) |
+| `execute_pipeline.sh` | venv activate, VertexProxy lifecycle, `PYTHONUNBUFFERED=1 python3 -u main.py` (pipeline or `export_to_workspace`) |
 | `run.sh` | GCP + Firecrawl checks, Xcode build, launch `.app` (no graph path verification) |
 | `clean_kb.sh` | Deep-clean contents of each top-level KB subfolder (including `runs/`) |
-| `test_backend.sh` | Full pipeline smoke test; verifies artefacts via `session_path` from PIPELINE_RESULT JSON |
+| `test_backend.sh` | Full pipeline smoke test; `stdbuf -oL` on `execute_pipeline.sh` for live log streaming; verifies artefacts via `session_path` from PIPELINE_RESULT JSON |
 
 ---
 
@@ -744,6 +771,7 @@ Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `Input
 
 ### Rate-limit & fail-fast
 
+* **Phase 2 Semantic Scholar** — Paced like arXiv: sequential keywords, `Retry-After` on 429, bounded per-keyword retries, circuit breaker stops further S2 calls for the run; partial S2 results are kept; arXiv and Tavily still populate `academic_scrape.md` (non-fatal degradation)
 * DataRefiner exhaustion → `RuntimeError` → orchestrator skips corrupt markdown writes
 * GraphAnalyzer: per-category regional failover; partial map failure → empty array for that category + `error` string; total map failure → `_empty_analysis()`; graph still loads in UI
 
@@ -772,13 +800,26 @@ Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `Input
 3. **Interactive queries** — Use `execute_graph_query` / `execute_graph_path` (or HTTP wrappers) scoped to `session_dir/graphify-out/` only.
 4. **Gap-analysis parity** — Phase 4.5 must not read corpora that Graphify did not map (`raw_ingestion/`). Keep `processed_summaries/` + `agent_scrapes/` as the shared source-of-truth directories for both phases.
 
+### Phase 2 academic discovery rules
+
+1. **S2 pacing** — Keep sequential keyword calls with `S2_KEYWORD_DELAY_SEC`; use `Retry-After` + `S2_429_MAX_RETRIES`; do not reintroduce unbounded Tenacity retry storms on S2 HTTP.
+2. **Non-fatal S2** — Circuit breaker may skip remaining S2 keywords; never block arXiv/Tavily or fail the Academic thread solely on S2 429.
+3. **Dedup reporting** — Log `Academic sources (after dedup)` only after `_cross_source_dedup`.
+4. **API key guidance** — When keyless and circuit opens, include `SEMANTIC_SCHOLAR_API_KEY` hint in the circuit PROGRESS line; avoid duplicate trailing 429 banners.
+
 ### Phase 2.2 / academic full-text rules
 
 1. **Metadata vs full text** — `agent_scrapes/academic_scrape.md` is abstracts/metadata only; never embed partial or full PDF bodies there.
 2. **DataRefiner bypass** — `academic_fulltext_*.md` must not be concatenated into `raw_corpus` for Phase 2.5.
 3. **Graphify intake** — Register every full-text path on `current_run_files` immediately after write so Phase 4 and 4.5 see them via `processed_summaries/` inclusion rules.
 4. **Triage contract** — Flash returns exact `triage_id` values; OA backfill applies when a selected PDF download fails.
-5. **No Firecrawl for PDFs** — Use `PdfExtractor` (PyMuPDF) only for paper PDFs.
+5. **PDF attempt cap** — Cap concurrent download work at `_FULLTEXT_TARGET + 3` (default 8); stop after 5 successful full-text saves.
+6. **No Firecrawl for PDFs** — Use `PdfExtractor` (PyMuPDF) only for paper PDFs.
+
+### Phase 2.6 URL rules
+
+1. **S2 paper URLs** — Run `normalize_semanticscholar_crawl_url()` in `_dedupe_url_entries` using ids from `academic_scrape.md`; drop URLs that cannot be validated or fuzzy-repaired.
+2. **Do not rely on Firecrawl for S2 HTML** — Anti-bot skips on `semanticscholar.org/paper/…` are expected; metadata already comes from the S2 API in Phase 2.
 
 ### Phase 4.5 / gap-analysis rules
 
@@ -832,7 +873,11 @@ Optional environment variables:
 | `RESEARCHBOT_OAUTH_CREDENTIALS` | Absolute path to OAuth `credentials.json` (set by Swift on export) |
 | `GRAPHIFY_TOKEN_BUDGET` | Per-chunk Graphify extraction budget (default `8192`) |
 | `TAVILY_API_KEY` | Social + academic Tavily searches |
-| `SEMANTIC_SCHOLAR_API_KEY` | Optional S2 rate-limit header (`x-api-key`) |
+| `SEMANTIC_SCHOLAR_API_KEY` | Optional S2 `x-api-key` header (dedicated ~1 RPS vs shared keyless pool) |
+| `S2_KEYWORD_DELAY_SEC` | Pause between Semantic Scholar keyword queries (default `3`; set `0` for local dev) |
+| `S2_POST_429_COOLDOWN_SEC` | Extra pause after a 429-exhausted keyword before the next attempt (default `15` keyless / `5` keyed) |
+| `S2_429_MAX_RETRIES` | Per-keyword 429 retries after honoring `Retry-After` (default `2`) |
+| `S2_CIRCUIT_BREAKER` | When `true` (default), skip remaining S2 keywords after 429 exhaustion on any keyword |
 | `ARXIV_REQUEST_DELAY_SEC` | Pause between arXiv keyword queries (default `3`; set `0` for local dev) |
 | `ACADEMIC_TRIAGE_POOL_MAX` | Max OA papers sent to Flash triage (default `25`) |
 | `ACADEMIC_FULLTEXT_MAX_CHARS` | Cap per full-document extraction (default `100000`) |
