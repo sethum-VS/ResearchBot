@@ -107,7 +107,14 @@ def _build_content_prompt(
     papers_block = []
     for i, paper in enumerate(matched_papers, 1):
         title = paper.get("title", "Untitled")
-        abstract = paper.get("abstract", "No abstract available.")[:2000]
+        
+        # Prioritize the combined Abstract + Conclusion. Fallback to just the abstract.
+        # Increase limit to 6000 to ensure the conclusion isn't truncated.
+        if "abstract_conclusion" in paper and paper["abstract_conclusion"]:
+             paper_text = paper["abstract_conclusion"][:6000]
+        else:
+             paper_text = paper.get("abstract", "No abstract available.")[:3000]
+             
         source = paper.get("source_url", paper.get("source", ""))
         year = paper.get("year", "N/A")
         score = paper.get("match_score", "N/A")
@@ -121,7 +128,7 @@ def _build_content_prompt(
         )
         if pdf_url:
             entry += f"- PDF: {pdf_url}\n"
-        entry += f"- Abstract: {abstract}\n"
+        entry += f"- Paper Content: {paper_text}\n"
         papers_block.append(entry)
 
     papers_text = "\n".join(papers_block)
@@ -163,13 +170,17 @@ def _build_content_prompt(
     return f"""\
 Generate a rigorous academic project proposal based on the following inputs.
 
-## SCOPED RESEARCH IDEA
+## USER'S CUSTOM PROJECT IMPLEMENTATION
 {scoped_idea}
+
+DIRECTIVE: You are an academic ghostwriter. The User's Custom Project Implementation provided above is the ABSOLUTE TRUTH of what this proposal is about. You must build the ENTIRE proposal around implementing this exact idea. Do not pivot to other concepts found in the literature. Do not invent a different project. The literature matrix and gap analysis provided below are ONLY to be used as supporting evidence to justify the user's specific implementation.
 
 ## MATCHED LITERATURE ({len(matched_papers)} papers, scored > 75% relevance)
 {papers_text}
 
-## GAP ANALYSIS FROM KNOWLEDGE GRAPH (Phase 4.5 output)
+## CONTEXTUAL BACKGROUND (HISTORICAL GAP ANALYSIS)
+Contextual Background (Historical Gap Analysis): This data shows the broader research environment. Use this ONLY to provide background context for why the user's specific project is necessary. Do not adopt these historical gaps as the primary focus if they conflict with the user's project idea.
+
 {gap_text if gap_text else "No gap analysis available for this session."}
 
 ## REQUIRED OUTPUT STRUCTURE
@@ -211,7 +222,8 @@ applicable.
 
 # V. Technical Architecture & Contribution
 Describe the novel element being built. Be specific about the architecture, \
-method or system. Explain why existing approaches cannot achieve this.
+method or system. Explain why existing approaches cannot achieve this. \
+The core technical contribution MUST be the exact system/module requested by the user. If the user proposed a 'Progressive Context Delivery module', that must be the center of this section.
 
 ## V.A Feature Set
 Organize features into three tiers:

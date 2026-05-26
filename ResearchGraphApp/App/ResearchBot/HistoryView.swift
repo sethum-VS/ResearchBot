@@ -49,6 +49,7 @@ struct HistoryView: View {
     @State private var loadError: String?
     @State private var proposalSheetSession: HistorySession?
     @State private var reviewingProposal: ProposalResult?
+    @State private var proposalHistorySession: HistorySession?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -84,6 +85,19 @@ struct HistoryView: View {
                 onBack: {
                     reviewingProposal = nil
                     reloadSessions()
+                }
+            )
+        }
+        .sheet(item: $proposalHistorySession) { session in
+            ProposalHistorySheet(
+                session: session,
+                bridge: bridge,
+                onReview: { result in
+                    proposalHistorySession = nil
+                    reviewingProposal = result
+                },
+                onDismiss: {
+                    proposalHistorySession = nil
                 }
             )
         }
@@ -174,6 +188,9 @@ struct HistoryView: View {
                         },
                         onCreateProposal: {
                             proposalSheetSession = session
+                        },
+                        onViewProposals: {
+                            proposalHistorySession = session
                         }
                     )
                 }
@@ -333,6 +350,7 @@ private struct HistoryCard: View {
     @Bindable var bridge: PythonBridge
     var onOpen: () -> Void
     var onCreateProposal: () -> Void
+    var onViewProposals: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -401,13 +419,16 @@ private struct HistoryCard: View {
                 .controlSize(.small)
 
                 if session.hasProposals {
-                    Text("\(session.proposalCount)")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.accentColor)
-                        .clipShape(Capsule())
+                    Button {
+                        onViewProposals()
+                    } label: {
+                        Text("\(session.proposalCount) Proposals")
+                            .font(.caption2.weight(.bold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                    .controlSize(.small)
+                    .clipShape(Capsule())
                 }
             }
         }

@@ -667,7 +667,7 @@ def _build_table_requests(
 
 
 def _populate_table_after_creation(
-    docs, doc_id: str, table_data: list[list[str]], table_index: int
+    docs, doc_id: str, table_data: list[list[str]], table_index: int, ref_entries: list[dict[str, str]] = None
 ) -> None:
     """
     After creating a table, read the doc to find the table element,
@@ -724,6 +724,39 @@ def _populate_table_after_creation(
                             "fields": "bold",
                         }
                     })
+                elif col_idx == 1 and ref_entries:
+                    cell_lower = cell_text.strip().lower()
+                    matched_url = None
+                    for ref in ref_entries:
+                        ref_title = ref.get("title", "").lower()
+                        if ref_title and (cell_lower in ref_title or ref_title in cell_lower):
+                            matched_url = ref.get("url")
+                            break
+                        if "..." in cell_lower:
+                            base_cell = cell_lower.split("...")[0].strip()
+                            if base_cell and base_cell in ref_title:
+                                matched_url = ref.get("url")
+                                break
+                    
+                    if matched_url:
+                        bold_requests.append({
+                            "updateTextStyle": {
+                                "range": {
+                                    "startIndex": para_start,
+                                    "endIndex": para_start + len(cell_text.strip()),
+                                },
+                                "textStyle": {
+                                    "link": {"url": matched_url},
+                                    "foregroundColor": {
+                                        "color": {
+                                            "rgbColor": {"red": 0.0, "green": 0.0, "blue": 0.8}
+                                        }
+                                    },
+                                    "underline": True,
+                                },
+                                "fields": "link,foregroundColor,underline",
+                            }
+                        })
 
     # Execute cell population (must be done in reverse index order to avoid offset shifts)
     all_reqs = populate_requests + bold_requests
@@ -775,7 +808,7 @@ def _strip_bold_markers(text: str) -> tuple[str, list[tuple[int, int]]]:
 
 
 def _markdown_to_docs_pipeline(
-    docs, doc_id: str, markdown_text: str
+    docs, doc_id: str, markdown_text: str, ref_entries: list[dict[str, str]] = None
 ) -> int:
     """
     Full Markdown-to-Google-Docs conversion pipeline.
@@ -950,7 +983,7 @@ def _markdown_to_docs_pipeline(
         ).execute()
 
         # Populate cells and bold header
-        _populate_table_after_creation(docs, doc_id, table_data, table_index)
+        _populate_table_after_creation(docs, doc_id, table_data, table_index, ref_entries)
 
     return cursor
 
@@ -1177,15 +1210,20 @@ def export_proposal_to_workspace(
     except OSError as e:
         return {"status": "error", "message": f"Cannot read proposal: {e}"}
 
-    # Load matched papers if provided
+    # Load matched papers if provided or auto-discover
     matched_papers: list[dict] = []
+    
+    mp_path = None
     if matched_papers_json:
         mp_path = Path(matched_papers_json).expanduser()
-        if mp_path.is_file():
-            try:
-                matched_papers = json.loads(mp_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning("Could not load matched_papers.json: %s", e)
+    else:
+        mp_path = proposal_file.parent / f"{proposal_file.stem}_matched_papers.json"
+
+    if mp_path and mp_path.is_file():
+        try:
+            matched_papers = json.loads(mp_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("Could not load matched_papers.json: %s", e)
 
     # Authenticate
     creds = get_credentials()
@@ -1208,31 +1246,38 @@ def export_proposal_to_workspace(
     doc_file = drive.files().create(body=doc_meta, fields="id").execute()
     doc_id = doc_file["id"]
 
+    # Link matched paper references directly
+    ref_entries: list[dict[str, str]] = []
+    if matched_papers:
+        for paper in matched_papers:
+            title = paper.get("title", "Untitled")
+            url = paper.get("source_url") or paper.get("source") or ""
+            ref_entries.append({
+                "name": title,
+                "title": title,
+                "url": url,
+            })
+
     print(
         "PROGRESS: Rendering proposal with native Google Docs formatting...",
         flush=True,
     )
 
     # Insert formatted proposal using native Docs API
-    final_cursor = _markdown_to_docs_pipeline(docs, doc_id, proposal_md)
+    final_cursor = _markdown_to_docs_pipeline(docs, doc_id, proposal_md, ref_entries)
 
-    # Upload matched paper references and append Section VII
-    ref_entries: list[dict[str, str]] = []
-    if matched_papers:
-        ref_entries = _upload_matched_paper_references(
-            drive, matched_papers, folder_id
-        )
-        if ref_entries:
-            # Re-read the doc to get the current end index
-            doc = docs.documents().get(documentId=doc_id).execute()
-            body_content = doc.get("body", {}).get("content", [])
-            if body_content:
-                last_element = body_content[-1]
-                end_index = last_element.get("endIndex", final_cursor)
-            else:
-                end_index = final_cursor
+    # Append Section VII
+    if ref_entries:
+        # Re-read the doc to get the current end index
+        doc = docs.documents().get(documentId=doc_id).execute()
+        body_content = doc.get("body", {}).get("content", [])
+        if body_content:
+            last_element = body_content[-1]
+            end_index = last_element.get("endIndex", final_cursor)
+        else:
+            end_index = final_cursor
 
-            _append_reference_section(docs, doc_id, ref_entries, end_index - 1)
+        _append_reference_section(docs, doc_id, ref_entries, end_index - 1)
 
     proposal_doc_url = _web_link(
         doc_id, drive, mime_type="application/vnd.google-apps.document"
@@ -1246,7 +1291,7 @@ def export_proposal_to_workspace(
         f"Exported: {ts}\n"
         f"Proposal Document: {proposal_doc_url}\n"
         f"Topic Folder: {folder_url}\n"
-        f"References: {len(ref_entries)} papers uploaded\n"
+        f"References: {len(ref_entries)} papers linked\n"
         f"{'—' * 40}\n\n"
     )
 
@@ -1277,6 +1322,6 @@ def export_proposal_to_workspace(
         "proposal_document_url": proposal_doc_url,
         "topic_folder_url": folder_url,
         "session_id": sid,
-        "references_uploaded": len(ref_entries),
+        "references_uploaded": len(ref_entries),  # Kept key name identical for Swift compatibility
     }
 

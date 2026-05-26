@@ -21,17 +21,17 @@ The workbench also provides **workspace run isolation** (every execution writes 
 | Layer | Technology |
 |-------|------------|
 | **Platform** | macOS (optimized for Apple Silicon) |
-| **Frontend** | SwiftUI (`@Observable`), `WKWebView` (Graphify HTML), native Markdown viewer, `URLSession` → VertexProxy graph APIs |
-| **Backend** | Python 3.10+, subprocess bridge via `execute_pipeline.sh` → `main.py` |
+| **Frontend** | SwiftUI (`@Observable`), `WKWebView` (Graphify HTML), native Markdown viewer, `URLSession` → VertexProxy graph APIs, custom glassmorphic overlay sheets for Phase 5 (`ProposalInputSheet`, `ProposalReviewView`) |
+| **Backend** | Python 3.10+, subprocess bridge via `execute_pipeline.sh` → `main.py`, standalone academic proposal engine (`ProposalOrchestrator.py`) |
 | **Local proxy** | `VertexProxy.py` (FastAPI on port 8000) — OpenAI-compatible bridge to Vertex AI; hosts `/api/graph/*` interactive endpoints |
-| **Google Workspace** | `google-api-python-client`, `google-auth-oauthlib`, `google-auth` — Drive + Docs APIs; OAuth desktop flow writes to the signed-in user’s Drive |
+| **Google Workspace** | `google-api-python-client`, `google-auth-oauthlib`, `google-auth` — Drive + Docs APIs; OAuth desktop flow writes to the signed-in user’s Drive, upgraded with native Markdown-to-Docs parser and direct academic source hyperlinks |
 
 ### AI Models
 
 | Model | Role |
 |-------|------|
-| **Gemini 2.5 Flash** | Phase 1.5 input analysis; **Phase 2.2 academic full-text triage**; Phase 2.6 high-value URL extraction; post-Graphify community naming |
-| **Gemini 2.5 Pro** | Phase 2.5 noise refinement; Phase 3 synthesis; **Phase 4.5 Map-Reduce gap analysis** (3 parallel category calls + executive summary) |
+| **Gemini 2.5 Flash** | Phase 1.5 input analysis; **Phase 2.2 academic full-text triage**; Phase 2.6 high-value URL extraction; post-Graphify community naming; **Phase 5.1 input scoping and Phase 5.4 candidate paper semantic match-scoring** |
+| **Gemini 2.5 Pro** | Phase 2.5 noise refinement; Phase 3 synthesis; **Phase 4.5 Map-Reduce gap analysis** (3 parallel category calls + executive summary); **Phase 5.5 academic proposal synthesis with strict Roman numeral layout** |
 | **Llama 4 Scout** | Phase 4 knowledge-graph extraction (10M context via VertexProxy) |
 
 ### Data Ingestion APIs
@@ -41,7 +41,7 @@ The workbench also provides **workspace run isolation** (every execution writes 
 * **arXiv API** — Atom export API (`export.arxiv.org`) for CS/FYP preprints; rate-paced multi-keyword queries
 * **Tavily API** — Social leads (Reddit/X); academic domain search on `arxiv.org`, `researchgate.net`, `scholar.google.com` (merged with S2 + arXiv in `AcademicScraper.py`)
 * **MediaWiki API** — Foundational definitions and Wiki context
-* **PyMuPDF (`pymupdf`)** — In-memory PDF text extraction via `PdfExtractor.py` (partial pages for legacy path; **full document** for Phase 2.2 triage)
+* **PyMuPDF (`pymupdf`)** — In-memory PDF text extraction via `PdfExtractor.py` (partial pages for legacy path; **full document** for Phase 2.2 triage; **Abstract + Conclusion** bookends extraction for Phase 5 candidate scoring)
 
 ### Google Workspace (Export)
 
@@ -51,7 +51,7 @@ The workbench also provides **workspace run isolation** (every execution writes 
 | **Client secrets** | `credentials.json` bundled in the macOS app (`App/ResearchBot/credentials.json`, gitignored) |
 | **Token storage** | `~/Library/Application Support/ResearchBot/token.json` (persisted after first browser login) |
 | **Scopes** | `drive`, `documents` |
-| **Drive layout** | Per-run topic folder + shared **Master Tracking Document** at Drive root |
+| **Drive layout** | Per-run topic folder + shared **Master Tracking Document** at Drive root. For Phase 5 proposals: Native Markdown-to-Google-Docs formatting engine (inserting styled headings, bullet lists, structural tables, and bold style ranges) + direct academic source hyperlinks in literature review table and reference section |
 
 ---
 
@@ -115,7 +115,9 @@ SwiftUI (PythonBridge)
     ├── HistoryView — enumerate runs/session_* on disk; load historical graph + gap JSON
     ├── InputView — runPipeline(idea:) → Process
     ├── GraphTerminalView — URLSession POST → VertexProxy /api/graph/query|path
-    └── exportToWorkspace(sessionId:kbRoot:) → Process (export command)
+    ├── ProposalInputSheet & ProposalReviewView — glassmorphic sheets to scope research ideas and review proposals
+    ├── generateProposal(sessionId:projectIdea:kbRoot:) → Process (generate_proposal command)
+    └── exportToWorkspace(sessionId:kbRoot:matchedPapersJson:) → Process (export command with native styling & references)
 
 execute_pipeline.sh [--idea "..."] [--url "..."]
     ├── Activates Backend/.venv
@@ -124,7 +126,9 @@ execute_pipeline.sh [--idea "..."] [--url "..."]
             ├── Default: IngestSeedUseCase.execute()
             │       ├── FileStorage.create_session_dir(idea)  → RESEARCHBOT_SESSION_DIR
             │       └── stdout: PROGRESS lines + ---PIPELINE_RESULT_START--- JSON
-            └── --command export_to_workspace --session-id ... --kb-root ...
+            ├── --command generate_proposal --session-id ... --project-idea ... [--kb-root ...]
+            │       └── ProposalOrchestrator → ---PROPOSAL_RESULT_START--- JSON
+            └── --command export_to_workspace --session-id ... --kb-root ... [--matched-papers-json ...]
                     └── ExportWorkspaceUseCase → ---WORKSPACE_EXPORT_RESULT_START--- JSON
 ```
 
@@ -432,6 +436,60 @@ Triggered from the SwiftUI app **after** a session has completed Phase 4.5 (requ
 ---WORKSPACE_EXPORT_RESULT_END---
 ```
 
+### Phase 5: Academic Proposal Generation & Standalone Pipeline
+
+This is a post-analysis phase that acts as a standalone pipeline. Students leverage their existing session’s research topology to scope and draft formal academic project proposals. 
+
+| Item | Detail |
+|------|--------|
+| **Module** | `ProposalOrchestrator.py` — Orchestrates scoping, external query expansion, evaluation, and proposal generation. |
+| **Trigger** | Swift UI button click or command line: `main.py --command generate_proposal --session-id <id> --project-idea "<idea>"` |
+| **Model** | Gemini 2.5 Pro (synthesis), Gemini 2.5 Flash (scoping + paper match-scoring) |
+| **Output files** | `proposals/proposal_<timestamp>.md` (Academic proposal), `proposals/matched_papers.json` (Curated top matching references list) |
+
+#### Execution Flow
+
+1. **Phase 5.1: Deep Semantic Expansion & Scoping (`_scope_input`)**:
+   - Uses Gemini 2.5 Flash with a structured Pydantic schema (`ProposalScopingAnalysis`) to evaluate the user's raw idea against prior session context (`session_manifest.json` topic).
+   - Generates a precise `scoped_query` (defining task, domain, and constraint), `search_queries` (exactly 5 specialized academic search statements targeting methodology, architectures, limitations, and constraints), and `core_criteria` (2-sentence relevance baseline).
+
+2. **Phase 5.2: Candidate Mega-Pool Builder & Deduplication**:
+   - Gathers candidate papers from:
+     - Local scraped papers in `agent_scrapes/academic_scrape.md`.
+     - Full-text processed papers in `processed_summaries/academic_fulltext_*.md`.
+     - 5 concurrent external searches using the LLM-generated `search_queries` against Semantic Scholar and Tavily.
+   - Deduplicates the full pool by normalized title, URL, or triage ID.
+
+3. **Phase 5.3: PDF Bookends Enrichment**:
+   - For all papers in the pool with `pdf_url` or `openAccessPdf` links, a background ThreadPoolExecutor downloads the PDF and extracts the Abstract and Conclusion bookends using PyMuPDF and `extract_academic_bookends` (capped at 8,000 chars for efficiency).
+
+4. **Phase 5.4: Semantic Scoring & Relevance Filter (`SemanticMatcher.py`)**:
+   - Evaluates each paper against the `core_criteria` using Gemini 2.5 Flash.
+   - The prompt instructs the model to critique the user's project idea against the combined context of what the paper set out to do (Abstract) and what they achieved or encountered as limits (Conclusion).
+   - Applies a strict **relevance threshold (> 75%)** and retains the top 15 highest-scoring papers (saves to `matched_papers.json`).
+
+5. **Phase 5.5: Proposal Synthesis (`ProposalSynthesizer.py`)**:
+   - Gemini 2.5 Pro consumes the scoped project definition, the gap analysis, and the top matched papers to synthesize a formal Markdown proposal conforming to a rigid Roman numeral academic structure:
+     * **I. Executive Summary (The Problem & The Novelty)**: A compelling 2-3 paragraph introduction explaining the core problem and solution.
+     * **II. Project Definition**: Detailed specifications (Task, Domain, Constraints).
+     * **III. Matched Literature Review**: Highlighting the selected papers.
+     * **IV. Academic Gap Alignment**: Synthesizing opportunities from the graph.
+     * **V. Proposed Architecture & Methodology**: Divided into *V.A Feature Set* and *V.B Technical Challenges*.
+     * **VI. Verification & Execution Plan**.
+
+---
+
+### Upgraded Google Workspace Export (Native Formatting)
+
+The Workspace Export (`GoogleWorkspaceManager.py`) has been upgraded from raw Markdown dumps to a native formatting pipeline:
+
+1. **Native Paragraph Parsing**: Iterates through the generated proposal markdown, building native Google Docs requests for headers (Heading 1-3), bullet points, regular text, and bold style ranges (e.g., `**text**` is parsed and styled with bold text properties rather than printing raw asterisks).
+2. **Tabular Formatting**: Detects and parses Markdown tables into native Google Doc tables, populating cells with standard styled text.
+3. **Direct Literature Reference Linking**: Auto-discovers or loads `matched_papers.json` and extracts direct academic source URLs (arXiv, Semantic Scholar, etc.) to hyper-link paper names directly in the literature review tables.
+4. **Clickable Doc Hyperlinks**: Inserts a formal **"VII. Reference Materials"** section at the bottom of the Google Doc, containing bulleted entries for each matched reference, with the title hyperlinked directly to its original academic source URL.
+
+---
+
 ### Session Manifest (orchestrator-written)
 
 After Phase 3, `IngestSeedUseCase` writes `session_dir/session_manifest.json`:
@@ -463,6 +521,9 @@ After Phase 3, `IngestSeedUseCase` writes `session_dir/session_manifest.json`:
         │   ├── graph.json
         │   ├── graph.html         # RAW_NODES must include every graph.json node id
         │   └── GRAPH_REPORT.md
+        ├── proposals/             # Phase 5 Academic Proposals
+        │   ├── proposal_<timestamp>.md   # Synthesized academic proposal markdown
+        │   └── matched_papers.json       # Top 15 matching papers list (> 75% relevance scoring)
         ├── session_manifest.json  # HistoryView metadata
         └── academic_gap_analysis.json  # Persisted Phase 4.5 payload
 ```
@@ -485,10 +546,25 @@ Historical sessions under `runs/` are preserved unless the user explicitly reque
 
 Python prints the final payload between:
 
+**Pipeline Result:**
 ```
 ---PIPELINE_RESULT_START---
 { ... JSON ... }
 ---PIPELINE_RESULT_END---
+```
+
+**Proposal Generation Result:**
+```
+---PROPOSAL_RESULT_START---
+{ ... JSON ... }
+---PROPOSAL_RESULT_END---
+```
+
+**Workspace Export (both Gap Analysis & Proposal Export):**
+```
+---WORKSPACE_EXPORT_RESULT_START---
+{ ... JSON ... }
+---WORKSPACE_EXPORT_RESULT_END---
 ```
 
 Live progress lines (`PROGRESS: Phase X — ...`) are streamed to the Swift console during execution.
@@ -509,6 +585,19 @@ Live progress lines (`PROGRESS: Phase X — ...`) are streamed to the Swift cons
 | `synthesis_preview` | string | First 500 chars of Phase 3 synthesis |
 | `graphify` | object | `{ ran, stdout, error }` |
 | `academic_gap_analysis` | object | Phase 4.5 structured insights (see below) |
+
+### Success payload schema (`main.py` / `_run_proposal_generation`)
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `status` | string | `"success"` or `"error"` |
+| `message` | string | Human-readable result |
+| `proposal_path` | string | Absolute path to `proposals/proposal_<timestamp>.md` |
+| `matched_papers_path` | string | Absolute path to `proposals/proposal_<timestamp>_matched_papers.json` |
+| `session_id` | string | Session directory basename (e.g. `session_20260520T235831Z_topic`) |
+| `scoped_query` | string | The precision query representing the scoped project idea |
+| `matched_paper_count` | integer | Number of curated papers scoring > 75% |
+| `proposal_id` | string | Unique proposal identifier `proposal_<timestamp>` |
 
 ### `academic_gap_analysis` schema
 
@@ -624,13 +713,16 @@ On `status == "error"`, the process exits with code `1` (missing session, missin
 |------|----------------|
 | `ResearchBotApp.swift` | App entry |
 | `ContentView.swift` | `AppScreen` routing: History → Input → Graph |
-| `HistoryView.swift` | Landing dashboard; enumerates `runs/session_*`; loads historical graph + gap JSON |
-| `PythonBridge.swift` | `Process()` → `execute_pipeline.sh`; parses `PipelineResult`; `URLSession` graph console |
+| `HistoryView.swift` | Landing dashboard; enumerates `runs/session_*`; loads historical graph + gap JSON; launches **ProposalInputSheet** and **ProposalHistorySheet** modals |
+| `PythonBridge.swift` | `Process()` → `execute_pipeline.sh`; parses `PipelineResult` and `ProposalResult`; `URLSession` graph console |
 | `GraphTerminalView.swift` | Interactive console: macros, path finder, transcript |
 | `GapAnalysisPanel.swift` | Concise right-side summary (metrics + CTA) |
 | `FullDetailWindow.swift` | Full-screen gap breakdown + reference navigation + **Export to Google Workspace** |
-| `GoogleWorkspaceExportView.swift` | Shared export button, OAuth-wait progress, success/error alerts |
+| `GoogleWorkspaceExportView.swift` | Shared export button, OAuth-wait progress, success/error alerts, support for native proposal export |
+| `ProposalInputSheet.swift` | Sleek glassmorphic overlay that captures the raw project idea and drives proposal generation with live progress parsing |
+| `ProposalReviewView.swift` | Immersive proposal viewer with split-view layout, listing the scoped idea, matching reference papers, and offering a native Doc format export |
 | `MarkdownViewer.swift` | Native Markdown reader for source verification |
+| `ProposalHistorySheet.swift` | Glassmorphic overlay listing all historically generated academic proposals for the active session, allowing direct, in-place review |
 
 ### Screen flow
 
@@ -638,6 +730,8 @@ On `status == "error"`, the process exits with code `1` (missing session, missin
 HistoryView (initial landing)
   ├── Card grid: timestamp, topic, URLRefiner count, session id
   ├── Per-card "Export to Google Workspace" (doc.badge.arrow.up)
+  ├── "Draft Proposal" button -> Present glassmorphic ProposalInputSheet (with session context preset)
+  ├── "View Proposals" button (if session has historical proposals) -> Present ProposalHistorySheet to browse and review them
   ├── Tap card → PythonBridge.loadHistoricalSession() → GraphView
   └── "New Research" → InputView
 
@@ -651,10 +745,22 @@ GraphView (HSplitView + optional bottom console)
   │     ├── Macros: Extract Core Gaps, Problem Intersection
   │     ├── Path finder: Source / Target → /api/graph/path
   │     └── Custom query → /api/graph/query
+  ├── "Draft Proposal" button in Toolbar -> Present glassmorphic ProposalInputSheet
   └── GapAnalysisPanel
         ├── Executive summary
         ├── Metric chips (hole / limitation / orphaned counts)
         └── "View Full Analysis" → .sheet(FullDetailWindow)
+
+ProposalInputSheet
+  ├── Input raw project idea text area
+  ├── Displays real-time logging output (scoping query, external scrapers, scoring, synthesis)
+  └── On success -> close sheet and launch full screen sheet of ProposalReviewView
+
+ProposalReviewView
+  ├── Document header: scoped project idea, matching literature list, creation timestamp
+  ├── Split layout: matching papers list vs. academic markdown proposal
+  ├── Navigation/Scroll through all Roman Numeral sections (I - VI)
+  └── Toolbar: Export to Google Doc (upgraded native format with direct academic source links)
 
 FullDetailWindow (full-screen page from GraphView)
   ├── Toolbar: Export to Google Workspace (prominent), Close
@@ -711,19 +817,22 @@ MarkdownViewer
 
 ```
 Backend/
-├── main.py                          # CLI entry; pipeline + export_to_workspace commands
+├── main.py                          # CLI entry; pipeline, export_to_workspace, generate_proposal, export_proposal_to_workspace commands
 ├── application/
 │   ├── IngestSeedUseCase.py         # Orchestrator; Phase 2.6 URL dedupe + S2 paper URL repair; manifest + gap JSON
 │   ├── ExportWorkspaceUseCase.py    # export_to_workspace(session_id, kb_root)
 │   ├── InputAnalyzer.py             # Phase 1.5
 │   ├── DataRefiner.py               # Phase 2.5
 │   ├── AgentSynthesizer.py          # Phase 3
-│       └── GraphAnalyzer.py             # Phase 4.5 (Map-Reduce, corpus alignment, async I/O)
+│   ├── GraphAnalyzer.py             # Phase 4.5 (Map-Reduce, corpus alignment, async I/O)
+│   ├── ProposalOrchestrator.py      # Phase 5 standalone coordinator (scoping, pool building, pipeline steps)
+│   └── ProposalSynthesizer.py       # Phase 5 proposal synthesis template and system prompt rules
 └── infrastructure/
-    ├── GoogleWorkspaceManager.py    # OAuth, Drive folder/doc upload, master tracker
+    ├── GoogleWorkspaceManager.py    # OAuth, Drive folder/doc upload, master tracker, upgraded native MD formatting & direct academic reference links
     ├── VertexProxy.py               # FastAPI :8000; /api/graph/* + OpenAI proxy
     ├── GraphifyRunner.py            # Phase 4; execute_graph_query; execute_graph_path
-    ├── TextChunker.py               # Phase 4.5 semantic bookends for oversized Markdown
+    ├── SemanticMatcher.py           # Phase 5 paper relevance scorer evaluating abstracts and conclusions
+    ├── TextChunker.py               # Phase 4.5 / Phase 5 semantic bookends for oversized Markdown
     ├── FileStorage.py               # Session dirs, save_markdown, RESEARCHBOT_SESSION_DIR
     ├── WebScraper.py                # Firecrawl
     ├── SocialScraper.py
@@ -837,9 +946,19 @@ Used by `VertexProxy` (pinned models), `DataRefiner`, `AgentSynthesizer`, `Input
 1. **Swift/Python boundary** — Swift only spawns the export process, passes `session_id` / `kb_root`, sets `RESEARCHBOT_OAUTH_CREDENTIALS`, and parses JSON. All Drive/Docs/OAuth logic lives in `GoogleWorkspaceManager.py`.
 2. **No service accounts** — Use OAuth desktop flow only; tokens belong to the end-user’s Google account.
 3. **Secrets hygiene** — `credentials.json` and `token.json` are gitignored; never commit OAuth client secrets or refresh tokens.
-4. **Export prerequisite** — Require persisted `academic_gap_analysis.json`; do not export sessions that never completed Phase 4.5.
+4. **Export prerequisite** — Require persisted `academic_gap_analysis.json` or generated proposals; do not export sessions that never completed Phase 4.5.
 5. **Master doc naming** — Fixed title `ResearchBot — Master Tracking Document`; search Drive by exact name before creating.
 6. **First-login UX** — Swift shows browser-wait copy when `token.json` is absent; Python opens the default browser via `run_local_server(port=0)`.
+7. **Native Doc formatting** — Translate markdown headers, bullets, and bold markers (`**text**`) into native Docs formatting requests; do not dump raw markdown. Parse markdown tables into beautiful structured Google Doc tables.
+8. **References source linkage** — Paper names in the literature table are automatically matched and hyperlinked directly to their original academic source URLs (e.g. arXiv/Semantic Scholar). Also appends a formal **"VII. Reference Materials"** section at the bottom of the Google Doc containing clickable hyperlinks to the same source URLs.
+
+### Phase 5 proposal rules
+
+1. **Scoping priority** — Scoping must combine raw user ideas with session manifest contexts to yield a `scoped_query` (defining task, domain, and constraint), exactly 5 distinct `search_queries` targeting methodology/constraints, and a 2-sentence `core_criteria` check.
+2. **Abstract + Conclusion scoring** — Before scoring a candidate paper, if it contains an active PDF link, extract the bookends (Abstract + Conclusion) with a safety limit of 8,000 characters. Evaluate the candidate paper against the `core_criteria` on whether the user's idea fits both the paper's original abstract scope and its final achievements/limitations.
+3. **Strict match threshold** — Apply a strict matching threshold **strictly > 75.0%** to filter candidate pools. Top 15 matches are synthesized. If fewer than 10 match, log a warning but proceed with the available papers.
+4. **Academic template alignment** — Synthesized proposals must follow the strict Roman numeral layout (I - VI) with narrative Executive Summaries (Section I), distinct constraints definitions (Section II), and Section V divided into V.A (Feature Set) and V.B (Technical Challenges).
+5. **Session proposals isolation** — Save generated proposals and matched reference arrays directly to `session_dir/proposals/proposal_<timestamp>.md` and `session_dir/proposals/<proposal_id>_matched_papers.json` respectively. Do not write to root-level folders.
 
 ### File system integrity
 
@@ -908,8 +1027,12 @@ Optional environment variables:
 | 3b | `IngestSeedUseCase` | `session_manifest.json` |
 | 4 | `GraphifyRunner.py` | `graphify-out/graph.{json,html}` |
 | 4.5 | `GraphAnalyzer.py` + `TextChunker.py` | `academic_gap_analysis` JSON (+ persisted `.json`) |
-| Export | `GoogleWorkspaceManager.py` | Drive topic folder, topic Doc, master tracker update |
-| UI | `HistoryView` | Archive browser + historical graph reload + per-card export |
+| 5 | `ProposalOrchestrator.py` + `ProposalSynthesizer.py` + `SemanticMatcher.py` | Precision scoping, candidate mega-pool, PDF bookends extraction, matching scores > 75%, and saved `proposals/proposal_*.md` + `proposals/matched_papers.json` |
+| Export | `GoogleWorkspaceManager.py` | Drive topic folder, topic Doc, master tracker update (raw gap analysis style) |
+| Proposal Export | `GoogleWorkspaceManager.py` | Upgraded Google Doc with native styles (headings, tables, bold styling), direct academic source links, and clickable link Section VII |
+| UI | `HistoryView` | Archive browser + historical graph reload + per-card export + draft proposal modal trigger + proposal history viewer |
 | UI | `GraphTerminalView` | Live `graphify query` / `path` via VertexProxy |
 | UI | `ContentView` + panels | Graph + gap summary + source viewer |
+| UI | `ProposalInputSheet` | Glassmorphic scoping log viewer sheet |
+| UI | `ProposalReviewView` | Immersive proposal viewer with upgraded Docs export dashboard |
 | UI | `GoogleWorkspaceExportView` | OAuth-aware export trigger + master doc link |
