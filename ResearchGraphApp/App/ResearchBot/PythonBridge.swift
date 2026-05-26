@@ -52,6 +52,7 @@ struct WorkspaceExportResult: Codable {
     let message: String
     let masterDocumentURL: String?
     let topicDocumentURL: String?
+    let proposalDocumentURL: String?
     let topicFolderURL: String?
     let sessionId: String?
 
@@ -59,8 +60,32 @@ struct WorkspaceExportResult: Codable {
         case status, message
         case masterDocumentURL = "master_document_url"
         case topicDocumentURL = "topic_document_url"
+        case proposalDocumentURL = "proposal_document_url"
         case topicFolderURL = "topic_folder_url"
         case sessionId = "session_id"
+    }
+}
+
+// MARK: - Proposal Generation Contract
+
+struct ProposalResult: Codable, Identifiable, Hashable {
+    var id: String { proposalId ?? UUID().uuidString }
+
+    let status: String
+    let message: String
+    let proposalPath: String?
+    let sessionId: String?
+    let scopedQuery: String?
+    let matchedPaperCount: Int?
+    let proposalId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, message
+        case proposalPath = "proposal_path"
+        case sessionId = "session_id"
+        case scopedQuery = "scoped_query"
+        case matchedPaperCount = "matched_paper_count"
+        case proposalId = "proposal_id"
     }
 }
 
@@ -84,6 +109,16 @@ final class PythonBridge {
     var workspaceExportMessage: String?
     var workspaceExportError: String?
     var masterDocumentURL: String?
+
+    // Proposal generation state
+    var isGeneratingProposal = false
+    var proposalProgress: String = ""
+    var proposalResult: ProposalResult?
+    var proposalError: String?
+    var isExportingProposal = false
+    var proposalExportMessage: String?
+    var proposalExportError: String?
+    var proposalDocumentURL: String?
 
     /// Local FastAPI proxy that hosts the interactive graph endpoints.
     private let proxyBaseURL = URL(string: "http://localhost:8000")!
@@ -383,10 +418,24 @@ final class PythonBridge {
         process.standardOutput = pipe
         process.standardError = pipe
 
+        // Drain stdout/stderr while the child runs. Reading only after waitUntilExit()
+        // can deadlock when the buffer fills (same pattern as executeProcess).
+        var capturedOutput = ""
+        let outputLock = NSLock()
+
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            outputLock.lock()
+            capturedOutput += chunk
+            outputLock.unlock()
+        }
+
         do {
             try process.run()
             process.waitUntilExit()
         } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
             await MainActor.run {
                 self.workspaceExportError = "Failed to launch export: \(error.localizedDescription)"
                 self.isExportingWorkspace = false
@@ -394,8 +443,17 @@ final class PythonBridge {
             return
         }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let trailing = pipe.fileHandleForReading.readDataToEndOfFile()
+        if !trailing.isEmpty, let tail = String(data: trailing, encoding: .utf8) {
+            outputLock.lock()
+            capturedOutput += tail
+            outputLock.unlock()
+        }
+
+        outputLock.lock()
+        let output = capturedOutput
+        outputLock.unlock()
 
         await MainActor.run {
             parseWorkspaceExportOutput(output, exitCode: process.terminationStatus)
@@ -435,6 +493,284 @@ final class PythonBridge {
             }
         } catch {
             workspaceExportError = "JSON decode error: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Proposal Generation
+
+    func generateProposal(sessionId sid: String, projectIdea: String, kbRoot kb: String?) {
+        guard !isGeneratingProposal else { return }
+        guard !sid.isEmpty else {
+            proposalError = "No session selected for proposal generation."
+            return
+        }
+        guard !projectIdea.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            proposalError = "Project idea cannot be empty."
+            return
+        }
+        guard let script = scriptPath else {
+            proposalError = "Could not locate execute_pipeline.sh."
+            return
+        }
+
+        isGeneratingProposal = true
+        proposalProgress = "Initializing proposal pipeline…\n"
+        proposalError = nil
+        proposalResult = nil
+        proposalDocumentURL = nil
+
+        let kbRootValue = kb ?? ""
+        let ideaValue = projectIdea
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.executeProposalGeneration(
+                script: script,
+                sessionId: sid,
+                projectIdea: ideaValue,
+                kbRoot: kbRootValue
+            )
+        }
+    }
+
+    nonisolated private func executeProposalGeneration(
+        script: String,
+        sessionId: String,
+        projectIdea: String,
+        kbRoot: String
+    ) async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        var args = [
+            script,
+            "--command", "generate_proposal",
+            "--session-id", sessionId,
+            "--project-idea", projectIdea,
+        ]
+        if !kbRoot.isEmpty {
+            args += ["--kb-root", kbRoot]
+        }
+        process.arguments = args
+
+        var env = ProcessInfo.processInfo.environment
+        let homeDir = NSHomeDirectory()
+        env["PATH"] = "\(homeDir)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+        Self.applyBackendDeploymentPaths(to: &env)
+        process.environment = env
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        // Stream progress lines to the UI while the process runs.
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            let bridge = self
+            Task { @MainActor in
+                bridge?.proposalProgress += chunk
+            }
+        }
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            await MainActor.run {
+                self.proposalError = "Failed to launch proposal process: \(error.localizedDescription)"
+                self.isGeneratingProposal = false
+            }
+            return
+        }
+
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let trailing = pipe.fileHandleForReading.readDataToEndOfFile()
+
+        let fullOutput = await MainActor.run { () -> String in
+            if !trailing.isEmpty, let tail = String(data: trailing, encoding: .utf8) {
+                self.proposalProgress += tail
+            }
+            return self.proposalProgress
+        }
+
+        await MainActor.run {
+            parseProposalOutput(fullOutput, exitCode: process.terminationStatus)
+            isGeneratingProposal = false
+        }
+    }
+
+    private func parseProposalOutput(_ raw: String, exitCode: Int32) {
+        let startMarker = "---PROPOSAL_RESULT_START---"
+        let endMarker = "---PROPOSAL_RESULT_END---"
+
+        guard let startRange = raw.range(of: startMarker),
+              let endRange = raw.range(of: endMarker),
+              startRange.upperBound < endRange.lowerBound else {
+            proposalError = exitCode != 0
+                ? "Proposal generation failed (exit \(exitCode)). Result markers not found."
+                : "Proposal generation finished but no result payload was returned."
+            return
+        }
+
+        let jsonString = String(raw[startRange.upperBound..<endRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let jsonData = jsonString.data(using: .utf8) else {
+            proposalError = "Failed to decode proposal response."
+            return
+        }
+
+        do {
+            let result = try JSONDecoder().decode(ProposalResult.self, from: jsonData)
+            if result.status == "error" {
+                proposalError = result.message
+                proposalResult = nil
+            } else {
+                proposalError = nil
+                proposalResult = result
+                proposalDocumentURL = nil
+            }
+        } catch {
+            proposalError = "JSON decode error: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Proposal Export to Google Workspace
+
+    func exportProposalToWorkspace(sessionId sid: String, proposalPath: String, kbRoot kb: String?) {
+        guard !isExportingProposal else { return }
+        guard !sid.isEmpty, !proposalPath.isEmpty else {
+            proposalExportError = "Missing session or proposal path."
+            return
+        }
+        guard let script = scriptPath else {
+            proposalExportError = "Could not locate execute_pipeline.sh."
+            return
+        }
+
+        isExportingProposal = true
+        proposalExportError = nil
+        proposalExportMessage = nil
+
+        let kbRootValue = kb ?? ""
+        let credsPath = oauthCredentialsPath
+
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.executeProposalExport(
+                script: script,
+                sessionId: sid,
+                proposalPath: proposalPath,
+                kbRoot: kbRootValue,
+                credentialsPath: credsPath
+            )
+        }
+    }
+
+    nonisolated private func executeProposalExport(
+        script: String,
+        sessionId: String,
+        proposalPath: String,
+        kbRoot: String,
+        credentialsPath: String?
+    ) async {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        var args = [
+            script,
+            "--command", "export_proposal_to_workspace",
+            "--session-id", sessionId,
+            "--proposal-path", proposalPath,
+        ]
+        if !kbRoot.isEmpty {
+            args += ["--kb-root", kbRoot]
+        }
+        process.arguments = args
+
+        var env = ProcessInfo.processInfo.environment
+        let homeDir = NSHomeDirectory()
+        env["PATH"] = "\(homeDir)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + (env["PATH"] ?? "")
+        Self.applyBackendDeploymentPaths(to: &env)
+        if let credentialsPath {
+            env["RESEARCHBOT_OAUTH_CREDENTIALS"] = credentialsPath
+        }
+        process.environment = env
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        var capturedOutput = ""
+        let outputLock = NSLock()
+
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+            outputLock.lock()
+            capturedOutput += chunk
+            outputLock.unlock()
+        }
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            pipe.fileHandleForReading.readabilityHandler = nil
+            await MainActor.run {
+                self.proposalExportError = "Failed to launch export: \(error.localizedDescription)"
+                self.isExportingProposal = false
+            }
+            return
+        }
+
+        pipe.fileHandleForReading.readabilityHandler = nil
+        let trailing = pipe.fileHandleForReading.readDataToEndOfFile()
+        if !trailing.isEmpty, let tail = String(data: trailing, encoding: .utf8) {
+            outputLock.lock()
+            capturedOutput += tail
+            outputLock.unlock()
+        }
+
+        outputLock.lock()
+        let output = capturedOutput
+        outputLock.unlock()
+
+        await MainActor.run {
+            parseProposalExportOutput(output, exitCode: process.terminationStatus)
+            isExportingProposal = false
+        }
+    }
+
+    private func parseProposalExportOutput(_ raw: String, exitCode: Int32) {
+        let startMarker = "---WORKSPACE_EXPORT_RESULT_START---"
+        let endMarker = "---WORKSPACE_EXPORT_RESULT_END---"
+
+        guard let startRange = raw.range(of: startMarker),
+              let endRange = raw.range(of: endMarker),
+              startRange.upperBound < endRange.lowerBound else {
+            proposalExportError = exitCode != 0
+                ? "Proposal export failed (exit \(exitCode))."
+                : "Export finished but no result payload was returned."
+            return
+        }
+
+        let jsonString = String(raw[startRange.upperBound..<endRange.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let jsonData = jsonString.data(using: .utf8) else {
+            proposalExportError = "Failed to decode export response."
+            return
+        }
+
+        do {
+            let result = try JSONDecoder().decode(WorkspaceExportResult.self, from: jsonData)
+            if result.status == "error" {
+                proposalExportError = result.message
+                proposalDocumentURL = nil
+            } else {
+                proposalExportError = nil
+                proposalExportMessage = result.message
+                proposalDocumentURL = result.proposalDocumentURL ?? result.topicDocumentURL
+            }
+        } catch {
+            proposalExportError = "JSON decode error: \(error.localizedDescription)"
         }
     }
 

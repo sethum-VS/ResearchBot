@@ -23,7 +23,7 @@ cd "$BACKEND_DIR"
 source .venv/bin/activate
 
 echo "Starting VertexProxy on port 8000…" >&2
-uvicorn infrastructure.VertexProxy:app --port 8000 --log-level warning &
+uvicorn infrastructure.VertexProxy:app --port 8000 --log-level warning >/dev/null 2>&1 &
 sleep 2
 
 if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null 2>&1; then

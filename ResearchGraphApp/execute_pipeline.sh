@@ -50,9 +50,21 @@ if [ ! -d ".venv" ]; then
 fi
 source .venv/bin/activate
 
-# --- Start Vertex AI Proxy (persists after this script exits) ---
-"$SCRIPT_DIR/ensure_vertex_proxy.sh"
-echo "✅ VertexProxy ready on port 8000."
+# --- Start Vertex AI Proxy (pipeline only; export does not need it) ---
+SKIP_VERTEX=0
+for arg in "$@"; do
+    if [ "$arg" = "export_to_workspace" ]; then
+        SKIP_VERTEX=1
+        break
+    fi
+done
+
+if [ "$SKIP_VERTEX" -eq 0 ]; then
+    "$SCRIPT_DIR/ensure_vertex_proxy.sh"
+    echo "✅ VertexProxy ready on port 8000."
+else
+    echo "⏭️  Skipping VertexProxy for workspace export."
+fi
 
 # --- Execute Backend (pass all args through to main.py) ---
 # Full pipeline (default):

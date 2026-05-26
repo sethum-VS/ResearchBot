@@ -23,8 +23,10 @@ struct HistorySession: Identifiable, Hashable {
     let topic: String                 // primary_keyword if known
     let urlRefinerCount: Int
     let graphHTMLPath: String?
+    let proposalCount: Int
 
     var hasGraph: Bool { graphHTMLPath != nil }
+    var hasProposals: Bool { proposalCount > 0 }
 
     /// Pretty-printed timestamp for the card header.
     var formattedDate: String {
@@ -45,6 +47,8 @@ struct HistoryView: View {
     @State private var sessions: [HistorySession] = []
     @State private var isLoading = false
     @State private var loadError: String?
+    @State private var proposalSheetSession: HistorySession?
+    @State private var reviewingProposal: ProposalResult?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -64,6 +68,25 @@ struct HistoryView: View {
         .frame(minWidth: 720, minHeight: 560)
         .appTextSelection()
         .onAppear { reloadSessions() }
+        .sheet(item: $proposalSheetSession) { session in
+            ProposalInputSheet(
+                session: session,
+                bridge: bridge,
+                onProposalReady: { result in
+                    reviewingProposal = result
+                }
+            )
+        }
+        .sheet(item: $reviewingProposal) { result in
+            ProposalReviewView(
+                proposalResult: result,
+                bridge: bridge,
+                onBack: {
+                    reviewingProposal = nil
+                    reloadSessions()
+                }
+            )
+        }
     }
 
     // MARK: - Header
@@ -142,10 +165,17 @@ struct HistoryView: View {
                 spacing: 16
             ) {
                 ForEach(sessions) { session in
-                    HistoryCard(session: session, bridge: bridge) {
-                        bridge.loadHistoricalSession(session)
-                        onOpenSession(session)
-                    }
+                    HistoryCard(
+                        session: session,
+                        bridge: bridge,
+                        onOpen: {
+                            bridge.loadHistoricalSession(session)
+                            onOpenSession(session)
+                        },
+                        onCreateProposal: {
+                            proposalSheetSession = session
+                        }
+                    )
                 }
             }
             .padding(20)
@@ -250,6 +280,15 @@ struct HistoryView: View {
             .appendingPathComponent("graph.html")
         let graphPath = fm.fileExists(atPath: graphURL.path) ? graphURL.path : nil
 
+        // Count proposals in proposals/ subdirectory
+        let proposalsDir = url.appendingPathComponent("proposals")
+        var proposalCount = 0
+        if let proposalEntries = try? fm.contentsOfDirectory(atPath: proposalsDir.path) {
+            proposalCount = proposalEntries.filter {
+                $0.hasSuffix(".md") && $0.hasPrefix("proposal_")
+            }.count
+        }
+
         return HistorySession(
             id: id,
             absolutePath: url.path,
@@ -257,7 +296,8 @@ struct HistoryView: View {
             createdAt: date,
             topic: topic,
             urlRefinerCount: urlRefinerCount,
-            graphHTMLPath: graphPath
+            graphHTMLPath: graphPath,
+            proposalCount: proposalCount
         )
     }
 
@@ -292,6 +332,7 @@ private struct HistoryCard: View {
     let session: HistorySession
     @Bindable var bridge: PythonBridge
     var onOpen: () -> Void
+    var onCreateProposal: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -340,14 +381,35 @@ private struct HistoryCard: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
 
-            GoogleWorkspaceExportButton(
-                bridge: bridge,
-                sessionId: session.id,
-                kbRoot: session.kbRoot,
-                prominent: false
-            )
-            .font(.caption)
-            .controlSize(.small)
+            HStack(spacing: 8) {
+                GoogleWorkspaceExportButton(
+                    bridge: bridge,
+                    sessionId: session.id,
+                    kbRoot: session.kbRoot,
+                    prominent: false
+                )
+                .font(.caption)
+                .controlSize(.small)
+
+                Button {
+                    onCreateProposal()
+                } label: {
+                    Label("Create Proposal", systemImage: "doc.text.below.ecg")
+                }
+                .buttonStyle(.bordered)
+                .font(.caption)
+                .controlSize(.small)
+
+                if session.hasProposals {
+                    Text("\(session.proposalCount)")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor)
+                        .clipShape(Capsule())
+                }
+            }
         }
         .padding(16)
         .frame(maxWidth: .infinity, minHeight: 160, alignment: .topLeading)

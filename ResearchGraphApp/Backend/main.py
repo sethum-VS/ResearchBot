@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py — ResearchBot Backend Entry Point (Phases 1.5–4.5)
+main.py — ResearchBot Backend Entry Point (Phases 1.5–4.5, Phase 5 Proposal)
 Accepts CLI arguments from the Swift PythonBridge, delegates to
 IngestSeedUseCase which runs scraping, storage, synthesis, graphify, and gap analysis.
 
@@ -43,9 +43,12 @@ load_dotenv(_resolve_env_path())
 
 from application.ExportWorkspaceUseCase import export_to_workspace
 from application.IngestSeedUseCase import execute
+from application.ProposalOrchestrator import generate_proposal
 
 WORKSPACE_START = "---WORKSPACE_EXPORT_RESULT_START---"
 WORKSPACE_END = "---WORKSPACE_EXPORT_RESULT_END---"
+PROPOSAL_START = "---PROPOSAL_RESULT_START---"
+PROPOSAL_END = "---PROPOSAL_RESULT_END---"
 
 
 def parse_args() -> argparse.Namespace:
@@ -54,8 +57,8 @@ def parse_args() -> argparse.Namespace:
         "--command",
         type=str,
         default="pipeline",
-        choices=("pipeline", "export_to_workspace"),
-        help="pipeline (default) or export_to_workspace",
+        choices=("pipeline", "export_to_workspace", "generate_proposal", "export_proposal_to_workspace"),
+        help="pipeline (default), export_to_workspace, generate_proposal, or export_proposal_to_workspace",
     )
     parser.add_argument("--idea", type=str, default="", help="Research idea or topic seed")
     parser.add_argument("--url", type=str, default="", help="Optional seed URL")
@@ -71,6 +74,24 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Absolute research_knowledge_base path for export_to_workspace",
     )
+    parser.add_argument(
+        "--project-idea",
+        type=str,
+        default="",
+        help="Project idea for generate_proposal command",
+    )
+    parser.add_argument(
+        "--proposal-path",
+        type=str,
+        default="",
+        help="Absolute path to proposal .md file for export_proposal_to_workspace",
+    )
+    parser.add_argument(
+        "--matched-papers-json",
+        type=str,
+        default="",
+        help="Absolute path to matched_papers.json for export_proposal_to_workspace",
+    )
     return parser.parse_args()
 
 
@@ -79,6 +100,14 @@ def main():
 
     if args.command == "export_to_workspace":
         _run_workspace_export(args)
+        return
+
+    if args.command == "generate_proposal":
+        _run_proposal_generation(args)
+        return
+
+    if args.command == "export_proposal_to_workspace":
+        _run_proposal_export(args)
         return
 
     try:
@@ -108,6 +137,60 @@ def _run_workspace_export(args: argparse.Namespace) -> None:
             result = export_to_workspace(session_id, args.kb_root or "")
         except Exception as e:
             result = {"status": "error", "message": f"Workspace export failed: {e}"}
+
+    print(f"\n{WORKSPACE_START}")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(WORKSPACE_END)
+
+    if result.get("status") == "error":
+        sys.exit(1)
+
+
+def _run_proposal_generation(args: argparse.Namespace) -> None:
+    session_id = (args.session_id or "").strip()
+    project_idea = (args.project_idea or "").strip()
+    if not session_id:
+        result = {"status": "error", "message": "--session-id is required for generate_proposal."}
+    elif not project_idea:
+        result = {"status": "error", "message": "--project-idea is required for generate_proposal."}
+    else:
+        try:
+            result = generate_proposal(
+                session_id=session_id,
+                user_project_idea=project_idea,
+                kb_root=args.kb_root or "",
+            )
+        except Exception as e:
+            result = {"status": "error", "message": f"Proposal generation failed: {e}"}
+
+    print(f"\n{PROPOSAL_START}")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(PROPOSAL_END)
+
+    if result.get("status") == "error":
+        sys.exit(1)
+
+
+def _run_proposal_export(args: argparse.Namespace) -> None:
+    from infrastructure.GoogleWorkspaceManager import export_proposal_to_workspace
+
+    session_id = (args.session_id or "").strip()
+    proposal_path = (args.proposal_path or "").strip()
+    matched_papers_json = (args.matched_papers_json or "").strip()
+    if not session_id:
+        result = {"status": "error", "message": "--session-id is required."}
+    elif not proposal_path:
+        result = {"status": "error", "message": "--proposal-path is required."}
+    else:
+        try:
+            result = export_proposal_to_workspace(
+                session_id=session_id,
+                proposal_path=proposal_path,
+                matched_papers_json=matched_papers_json or None,
+                kb_root=args.kb_root or None,
+            )
+        except Exception as e:
+            result = {"status": "error", "message": f"Proposal export failed: {e}"}
 
     print(f"\n{WORKSPACE_START}")
     print(json.dumps(result, indent=2, ensure_ascii=False))

@@ -17,6 +17,7 @@ enum AppScreen: Hashable {
     case history
     case input
     case graph
+    case proposal(ProposalResult)
 }
 
 // MARK: - Main Content View
@@ -78,6 +79,12 @@ struct ContentView: View {
                         onOpenSession: { _ in screen = .graph }
                     )
                 }
+            case .proposal(let result):
+                ProposalReviewView(
+                    proposalResult: result,
+                    bridge: bridge,
+                    onBack: { screen = .history }
+                )
             }
         }
     }
