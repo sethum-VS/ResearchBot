@@ -17,137 +17,96 @@ ResearchBot is split into a native macOS interface and a highly concurrent Pytho
 
 ```mermaid
 graph TD
-    %% Subgraphs for structural isolation
-    subgraph ClientSpace [Client Layer: macOS SwiftUI App]
+    %% Define components in a top-down, clean vertical stack
+
+    subgraph ClientLayer [Client Layer: macOS SwiftUI Application]
         UI[SwiftUI Interface]
-        WebView[WKWebView Vis-Network]
-        MDViewer[Native Markdown Viewer]
         Bridge[PythonBridge Process Wrapper]
+        WebView[WKWebView vis-network Explorer]
+        MDViewer[Native Markdown Viewer]
     end
 
-    subgraph LocalProxies [Local Intermediary & Bridge APIs]
-        Shell[execute_pipeline.sh Subprocess Launcher]
-        ProxyServer[VertexProxy FastAPI Server :8000]
+    subgraph InterfaceLayer [Local Communication & Bridging APIs]
+        Shell[execute_pipeline.sh Shell Script]
+        Proxy[VertexProxy FastAPI Server :8000]
     end
 
-    subgraph ContainerService [Local Runtime Services]
+    subgraph ProcessEngine [Python 3.10+ Orchestration Engine]
+        IngestUC[IngestSeedUseCase Ingestion Pipeline]
+        ProposalUC[ProposalOrchestrator Synthesis Engine]
+        ExportUC[ExportWorkspaceUseCase Workspace Exporter]
+    end
+
+    subgraph Scrapers [Concurrent Discovery & Scrapers]
+        Social[SocialScraper PyTavily]
+        Wiki[WikiAPI Definition Crawler]
+        Academic[AcademicScraper arXiv & Semantic Scholar]
         Firecrawl[Firecrawl Docker Container :3002]
-        Graphify[Graphify CLI Compiler]
+        PDF[PdfExtractor PyMuPDF]
     end
 
-    subgraph PythonBackend [Python 3.10+ Processing Engine]
-        Main[main.py CLI entry]
-        
-        subgraph UseCases [Use Case Orchestrators]
-            IngestUC[IngestSeedUseCase]
-            ProposalUC[ProposalOrchestrator]
-            ExportUC[ExportWorkspaceUseCase]
-        end
-
-        subgraph AnalysisLayer [Data Refinement & Models]
-            InputAnalyzer[InputAnalyzer]
-            DataRefiner[DataRefiner]
-            Synthesizer[AgentSynthesizer]
-            Matcher[SemanticMatcher]
-            ProposalSynthesizer[ProposalSynthesizer]
-            GraphAnalyzer[GraphAnalyzer Map-Reduce]
-        end
-
-        subgraph StorageDrivers [Local IO & Parsers]
-            FileStorage[FileStorage Writer]
-            TextChunker[TextChunker bookends]
-            PdfExtractor[PdfExtractor PyMuPDF]
-        end
-        
-        WorkspaceMgr[GoogleWorkspaceManager OAuth]
+    subgraph Analysis [Data Analysis & Extraction Layers]
+        Refiner[DataRefiner Gemini 2.5 Pro]
+        Graphify[Graphify CLI & Llama 4 Scout]
+        GapAnalyzer[GraphAnalyzer Map-Reduce Gemini]
+        Matcher[SemanticMatcher Relevance Scoring]
+        Synthesizer[ProposalSynthesizer Roman Numerals]
     end
 
-    subgraph IsolatedStorage [Isolated Session Workspace - Local FS]
+    subgraph Storage [Isolated Session Storage - Local File System]
         Runs[research_knowledge_base/runs/]
-        manifest[session_manifest.json]
-        gap_json[academic_gap_analysis.json]
-        scrapes[agent_scrapes/ refined ledger]
-        raw_ingest[raw_ingestion/ social feeds]
-        processed[processed_summaries/ pdfs + synthesis]
-        graph_out[graphify-out/ html + json]
-        proposals[proposals/ proposals + matched papers]
+        Manifest[session_manifest.json Metadata]
+        GapJson[academic_gap_analysis.json Payload]
+        Scrapes[agent_scrapes/ Refined Ledgers]
+        Processed[processed_summaries/ PDFs & Synthesis]
+        GraphOut[graphify-out/ Visual Assets]
+        Proposals[proposals/ Proposals & Matched Papers]
     end
 
-    subgraph ExternalServices [External Network Services]
-        VertexAI[Google Vertex AI API Gemini/Llama]
-        SemanticScholar[Semantic Scholar API]
-        arXiv[arXiv RSS/Atom API]
-        Tavily[Tavily Search API]
-        GoogleWorkspace[Google Drive & Docs APIs]
+    subgraph External [External Web Services]
+        VertexAI[Google Vertex AI API Gemini & Llama]
+        GoogleDocs[Google Workspace APIs Drive & Docs]
     end
 
-    %% Client Layer connections
-    UI -->|Render HTML| WebView
-    UI -->|Load file path| MDViewer
-    UI -->|URLSession GET/POST| ProxyServer
-    UI -->|Spawn shell process| Bridge
-    
-    %% Local Intermediaries connections
-    Bridge -->|Arguments & Environment| Shell
-    Shell -->|PYTHONUNBUFFERED execution| Main
-    
-    %% Pipeline entry connections
-    Main --> IngestUC
-    Main --> ProposalUC
-    Main --> ExportUC
+    %% Vertical Data Flow & Control
+    UI -->|Spawn process| Bridge
+    Bridge -->|Activate env| Shell
+    Shell -->|Trigger command| IngestUC
+    Shell -->|Trigger command| ProposalUC
+    Shell -->|Trigger command| ExportUC
 
-    %% IngestUseCase Data Flow & IO
-    IngestUC --> InputAnalyzer
-    IngestUC --> DataRefiner
-    IngestUC --> Synthesizer
-    IngestUC --> Graphify
-    IngestUC --> GraphAnalyzer
-    
-    %% Storage drivers connections
-    InputAnalyzer & DataRefiner & Synthesizer --> FileStorage
-    GraphAnalyzer --> TextChunker
-    GraphAnalyzer --> FileStorage
-    
-    %% Pdf Extractor
-    IngestUC & ProposalUC --> PdfExtractor
-    
-    %% Proposal Orchestration
-    ProposalUC --> Matcher
-    ProposalUC --> ProposalSynthesizer
-    ProposalUC --> FileStorage
+    %% Scrapers Execution
+    IngestUC -->|Parallel scrapes| Social & Wiki & Academic
+    Social & Wiki -->|Refine ledger| Refiner
+    Academic -->|PDF triage| PDF
+    IngestUC -->|Crawl web| Firecrawl
 
-    %% Workspace Export
-    ExportUC --> WorkspaceMgr
-
-    %% Session Disk writes
-    FileStorage -->|Write isolated runs| Runs
-    Runs -->|Session manifest| manifest
-    Runs -->|Gap JSON payload| gap_json
-    Runs -->|Web & Wiki scrapers| scrapes
-    Runs -->|Social scrapers| raw_ingest
-    Runs -->|Academic full-text & Phase 3| processed
-    Runs -->|CLI layout artifacts| graph_out
-    Runs -->|Academic proposals| proposals
-
-    %% Local containers
-    IngestUC -->|Scrape web| Firecrawl
-    Graphify -->|Read corpus| processed
-    Graphify -->|Compile visual assets| graph_out
-
-    %% External APIs
-    InputAnalyzer & DataRefiner & Synthesizer & Matcher & ProposalSynthesizer & GraphAnalyzer -->|HTTPS Vertex SDK / Region Failover| VertexAI
-    IngestUC & ProposalUC -->|HTTPS REST| SemanticScholar
-    IngestUC & ProposalUC -->|HTTP GET XML| arXiv
-    IngestUC & ProposalUC -->|HTTPS POST Search| Tavily
-    WorkspaceMgr -->|HTTPS Google REST v3| GoogleWorkspace
+    %% Processing & Analysis Flow
+    PDF & Refiner -->|Save processed docs| Processed
+    Processed -->|Ingest corpus| Graphify
+    Graphify -->|Compile network| GraphOut
+    GraphOut -->|Map topology| GapAnalyzer
     
-    %% Interactive terminal query path
-    ProxyServer -->|Run query path query| Graphify
-    
-    %% Native Reads from isolated directories
-    WebView -->|Load local asset| graph_out
-    MDViewer -->|Parse file content| processed & proposals
-    UI -->|Archival metrics| Runs
+    %% Scoping and Proposal Flow
+    ProposalUC -->|Scoping & scoring| Matcher
+    Matcher -->|Synthesize proposal| Synthesizer
+    Synthesizer -->|Write document| Proposals
+
+    %% Local Disk Storage mapping
+    IngestUC & ProposalUC & ExportUC -->|Session-isolated writes| Runs
+    Runs --> Manifest & GapJson & Scrapes & Processed & GraphOut & Proposals
+
+    %% External APIs Integration
+    Refiner & GapAnalyzer & Matcher & Synthesizer -->|HTTPS REST| VertexAI
+    ExportUC -->|OAuth Consent| GoogleDocs
+
+    %% UI Interactive Links
+    UI -->|URLSession POST queries| Proxy
+    Proxy -->|Local interrogations| Graphify
+    UI -->|Render HTML visualization| WebView
+    WebView -->|Read local graph| GraphOut
+    UI -->|Render raw files| MDViewer
+    MDViewer -->|Read documents| Processed & Proposals
 ```
 
 ---
