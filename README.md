@@ -120,15 +120,18 @@ The ingestion scraper pulls concurrently from Semantic Scholar, arXiv, and Tavil
 For all located papers featuring valid PDF URLs, ResearchBot executes a high-speed triage phase. Using Gemini 2.5 Flash, the engine filters up to 25 titles and abstracts, selects the top 5 most relevant targets, and pulls down full-document text via a PyMuPDF extraction pool.
 
 ### Interactive Knowledge Graphs
-Ingested documents are compiled into interactive visual networks using the Graphify engine and Llama 4 Scout (10M token context window) via a local Vertex AI proxy. Network nodes are programmatically named and color-coded based on dynamic community detection. The SwiftUI interface exposes a terminal console that connects directly to the proxy to compute node paths and execute structured queries.
+Ingested documents are compiled into structural visual networks using the Graphify entity-relation extraction framework. Graphify parses primary research documents into a typed graph schema using Llama 4 Scout (10M token context window) via the local FastAPI VertexProxy bridge. 
+
+Network nodes are grouped via Louvain-style modular community clustering, programmatically named using Gemini 2.5 Flash, and rendered interactively inside the SwiftUI interface using the vis-network engine. The interface also exposes an interactive console connected directly to the VertexProxy API to calculate node paths and execute graph queries.
 
 ### Map-Reduce Topology Analyzer
-The engine executes a three-part parallel Map-Reduce analysis to diagnose graph characteristics:
-* **Structural Holes**: Bridging opportunities between isolated communities.
-* **High-Degree Limitations**: Recurrent academic limitations and methodological gaps backed by citation weight.
-* **Orphaned Solutions**: Documented solutions lacking integrated target systems.
+The engine executes a parallel Map-Reduce topology analysis pipeline orchestrated with Python's asyncio framework and Gemini 2.5 Pro models. The analysis extracts key final-year project academic gaps using structural network algorithms combined with full-text source document books:
 
-To avoid regional rate limits, tasks are routed across sharded Vertex API pools (europe-west4, us-east4, and asia-northeast1) with automated regional failover cascades.
+* **Structural Holes (Burt's Structural Holes Theory)**: The algorithm parses the modular communities of the network to locate bridging opportunities—disconnected or loosely-coupled sub-graphs that can be synthetically integrated to provide novel research contributions.
+* **High-Degree Constraint Analysis (Degree Centrality)**: Computes edge counts and inbound citation weights for nodes classified as limitations or method weaknesses. Central constraints backed by multi-source primary evidence denote consensus technical bottlenecks.
+* **Orphaned Solutions Detection**: Filters for solution nodes displaying outgoing edges to failure/drawback nodes but lacking integrated target-system relationships. These denote proven engineering components that have not yet been successfully applied to current bottlenecks.
+
+To optimize token consumption, documents larger than 60,000 characters are processed using a Semantic Bookends Algorithm (infrastructure/TextChunker.py), which extracts and pairs abstract/introduction headers and discussion/conclusion headers while dropping middle sections. To avoid regional rate limits, Map tasks are sharded across parallel API pools (europe-west4, us-east4, and asia-northeast1) with automated regional failover cascades, before a consolidated Reduce step merges the findings into a structured JSON executive summary.
 
 ### Automated Proposal Synthesis
 A post-analysis workflow takes student ideas and correlates them with the active session history to write complete project proposals. Proposals are organized into a strict Roman numeral hierarchy:
