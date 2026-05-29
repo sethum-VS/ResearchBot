@@ -147,6 +147,46 @@ The native Google Workspace Exporter avoids simple plain-text dumps. It parses M
 
 ---
 
+## Advanced Corpus Allocation & Token Budgeting
+
+To run deep-dive Map-Reduce analysis without hitting model limits or regional quota walls, ResearchBot implements a multi-tiered token gating and dynamic allocation pipeline. The system enforces a rigorous target budget of **180,000 characters** (approximately 45,000 to 60,000 tokens), leaving safe headroom for massive structural topologies, prompts, and system instructions:
+
+### 1. Architectural File Filtering (Stage 1)
+To ensure the pipeline is grounded strictly in verified research rather than social media noise, ResearchBot filters incoming files at the directory level:
+* **Allowed Directories**: Only files residing in `processed_summaries/` and `agent_scrapes/` are loaded.
+* **Bypassed Directories**: Raw web crawled indexes and unfiltered social media data residing in `raw_ingestion/` are completely skipped during topology and gap analysis.
+
+### 2. Semantic Bookends Compression Algorithm (Stage 2)
+For individual files exceeding **60,000 characters**, ResearchBot executes an in-memory semantic compression process (`infrastructure/TextChunker.py`):
+* **Header Matching**: The chunker uses case-insensitive regular expressions to detect primary academic sections:
+  * **Intro Headers**: `Abstract`, `Introduction`
+  * **Outro Headers**: `Conclusion`, `Discussion`, `Future Work`, `Limitations`
+* **Section Extraction**: It extracts the text body starting from the abstract/introduction (up to the next Markdown heading level 1-6) and joins it with the entire conclusion/outro section through a marked break (`\n\n[... Middle sections omitted for brevity ...]\n\n`).
+* **Double Fallback**: If the section headers are missing or out of order, the chunker takes the first 30,000 characters and the last 30,000 characters of the file and joins them, guaranteeing the processed file fits under the **60,000 character limit** without breaking document schema.
+
+### 3. Protected Dynamic Bucket Allocation (Stage 3)
+Eligible files are sorted chronologically (newest-first) and mapped into dedicated, protected character budgets to prevent one massive document from starving other categories:
+* **Synthesis Budget (`_SYNTHESIS_BUDGET`)**: `40,000` characters baseline cap. Reserved for Phase 3 syntheses.
+* **Web Scrape Budget (`_WEB_SCRAPE_BUDGET`)**: `80,000` characters baseline cap. Reserved for web scrapers and refined ledgers.
+* **Academic Budget (`_ACADEMIC_BUDGET`)**: `120,000` characters baseline cap. Reserved for open-access PDF full texts.
+
+### 4. Asymmetric Budget Rollover (Stage 4)
+If a high-priority bucket consumes less than its allocated cap, the remaining headroom is rolled over to downstream categories:
+* **Synthesis Rollover**: Any unused synthesis character capacity is rolled over to the **Academic budget first**.
+* **Secondary Rollover**: If the Academic budget is completely satisfied, any remaining rollover is added to the **Web Scrape budget**.
+* **Integrity Packing**: Files are packed as complete blocks. If a file is larger than the remaining budget of its target bucket, the file is omitted entirely from the run rather than being head-truncated, maintaining complete document integrity.
+
+### 5. Global Character Safety Net (Stage 5)
+Once the dynamic buckets are packed, the entire merged corpus is audited. If the total length exceeds the global cap of **180,000 characters**, an eviction algorithm drops files lowest-priority first until the budget is met:
+1. `_urlrefiner` files and generic `agent_scrapes/`
+2. `academic_fulltext_` documents
+3. Phase 3 synthesis documents (never evicted)
+
+### 6. Reference Hygiene Validation (Stage 6)
+Any file omitted during Stage 3 (due to bucket caps) or evicted during Stage 5 (safety net) is stripped from the active loading manifests. The python script (`GraphAnalyzer.py`) compares the LLM output array against the list of surviving files. If the model cites a document that did not survive the allocation filters, the citation reference is automatically scrubbed, preventing model hallucinations.
+
+---
+
 ## Technical Prerequisites
 
 To compile and execute ResearchBot, your local workstation requires:
