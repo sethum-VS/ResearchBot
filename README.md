@@ -111,7 +111,9 @@ graph TD
 
 ---
 
-## Core Capabilities
+## Research Implementation Pipeline
+
+The Research Implementation Pipeline coordinates real-time data ingestion, open-access paper triaging, semantic entity extraction, and structural graph gap-hunting to isolate and diagnose academic limitations:
 
 ### Multi-Source Academic & Social Ingestion
 The ingestion scraper pulls concurrently from Semantic Scholar, arXiv, and Tavily to build a multi-dimensional foundation for analysis. The scraper implements rate-pacing protocols, backoffs based on HTTP Retry-After headers, and an automatic circuit-breaker behavior that skips degraded endpoints while preserving successful threads.
@@ -131,59 +133,59 @@ The engine executes a parallel Map-Reduce topology analysis pipeline orchestrate
 * **High-Degree Constraint Analysis (Degree Centrality)**: Computes edge counts and inbound citation weights for nodes classified as limitations or method weaknesses. Central constraints backed by multi-source primary evidence denote consensus technical bottlenecks.
 * **Orphaned Solutions Detection**: Filters for solution nodes displaying outgoing edges to failure/drawback nodes but lacking integrated target-system relationships. These denote proven engineering components that have not yet been successfully applied to current bottlenecks.
 
-To optimize token consumption, documents larger than 60,000 characters are processed using a Semantic Bookends Algorithm (infrastructure/TextChunker.py), which extracts and pairs abstract/introduction headers and discussion/conclusion headers while dropping middle sections. To avoid regional rate limits, Map tasks are sharded across parallel API pools (europe-west4, us-east4, and asia-northeast1) with automated regional failover cascades, before a consolidated Reduce step merges the findings into a structured JSON executive summary.
+### Advanced Corpus Allocation & Token Budgeting
+To run deep-dive Map-Reduce analysis without hitting model limits or regional quota walls, ResearchBot implements a multi-tiered token gating and dynamic allocation pipeline. The system enforces a rigorous target budget of **180,000 characters** (approximately 45,000 to 60,000 tokens), leaving safe headroom for massive structural topologies, prompts, and system instructions:
 
-### Automated Proposal Synthesis
-A post-analysis workflow takes student ideas and correlates them with the active session history to write complete project proposals. Proposals are organized into a strict Roman numeral hierarchy:
-* **I. Executive Summary**: Narrative problem and proposed innovation.
-* **II. Project Definition**: Clear boundary conditions, scopes, and project constraints.
-* **III. Matched Literature Review**: Critical assessment of top-scoring Open Access references (filtered through a strict 75% semantic threshold).
-* **IV. Academic Gap Alignment**: Technical alignment with the diagnosed graph topology.
-* **V. Architecture & Methodology**: Separated systematically into Feature Sets (V.A) and Technical Challenges (V.B).
-* **VI. Verification & Execution**: Empirical testing plan.
-
-### Upgraded Workspace Exporter
-The native Google Workspace Exporter avoids simple plain-text dumps. It parses Markdown inline markers (headers, bullet points, tables, and bold style ranges) and writes native Google Doc API styling instructions. The engine searches user Drive folders, creates runs-isolated directories, populates document text, auto-generates tabular literature sections, and links reference citations directly back to their academic web source URLs.
+* **Architectural File Filtering (Stage 1)**: Only files residing in `processed_summaries/` and `agent_scrapes/` are loaded. Raw web crawled indexes and unfiltered social media data residing in `raw_ingestion/` are completely skipped during topology and gap analysis.
+* **Semantic Bookends Compression Algorithm (Stage 2)**: For individual files exceeding **60,000 characters**, ResearchBot executes an in-memory semantic compression process (`infrastructure/TextChunker.py`). The chunker detects Abstract/Introduction and Conclusion/Limitations sections via regular expressions, extracting and joining them with a marked break, and falls back to a structural 30k head/tail slice if section headers are missing.
+* **Protected Dynamic Bucket Allocation (Stage 3)**: Mapped into synthesis summary (`40,000` chars), web scrape (`80,000` chars), and academic open-access PDF (`120,000` chars) protected character budgets.
+* **Asymmetric Budget Rollover (Stage 4)**: Unused synthesis capacity rolls over to the Academic budget first, then to the Web Scrape budget. Files are packed as complete blocks to maintain document integrity.
+* **Global Character Safety Net (Stage 5)**: If the merged corpus exceeds **180,000 characters**, an eviction algorithm drops files lowest-priority first (scrapes first, then full-text papers, never synthesis files).
+* **Reference Hygiene Validation (Stage 6)**: If the model cites a document that did not survive the allocation filters, the citation reference is automatically scrubbed, preventing model hallucinations.
 
 ---
 
-## Advanced Corpus Allocation & Token Budgeting
+## Academic Project Proposal Engine
 
-To run deep-dive Map-Reduce analysis without hitting model limits or regional quota walls, ResearchBot implements a multi-tiered token gating and dynamic allocation pipeline. The system enforces a rigorous target budget of **180,000 characters** (approximately 45,000 to 60,000 tokens), leaving safe headroom for massive structural topologies, prompts, and system instructions:
+The Academic Project Proposal Engine leverages the diagnosed graph gaps to scope research queries, evaluate academic literature, and synthesize complete, formal academic project proposals:
 
-### 1. Architectural File Filtering (Stage 1)
-To ensure the pipeline is grounded strictly in verified research rather than social media noise, ResearchBot filters incoming files at the directory level:
-* **Allowed Directories**: Only files residing in `processed_summaries/` and `agent_scrapes/` are loaded.
-* **Bypassed Directories**: Raw web crawled indexes and unfiltered social media data residing in `raw_ingestion/` are completely skipped during topology and gap analysis.
+### Deep Semantic Scoping & Expansion
+When a user submits a research idea, the Proposal Orchestrator scopes the concept using Gemini 2.5 Flash against the active session's manifest history (`session_manifest.json`). It expands the idea into:
+* A precision `scoped_query` defining the research Task, Domain, and Constraint.
+* Exactly 5 highly specialized academic search statements targeting methodologies, limitations, and architectures.
+* A 2-sentence `core_criteria` check used to score academic literature relevance.
 
-### 2. Semantic Bookends Compression Algorithm (Stage 2)
-For individual files exceeding **60,000 characters**, ResearchBot executes an in-memory semantic compression process (`infrastructure/TextChunker.py`):
-* **Header Matching**: The chunker uses case-insensitive regular expressions to detect primary academic sections:
-  * **Intro Headers**: `Abstract`, `Introduction`
-  * **Outro Headers**: `Conclusion`, `Discussion`, `Future Work`, `Limitations`
-* **Section Extraction**: It extracts the text body starting from the abstract/introduction (up to the next Markdown heading level 1-6) and joins it with the entire conclusion/outro section through a marked break (`\n\n[... Middle sections omitted for brevity ...]\n\n`).
-* **Double Fallback**: If the section headers are missing or out of order, the chunker takes the first 30,000 characters and the last 30,000 characters of the file and joins them, guaranteeing the processed file fits under the **60,000 character limit** without breaking document schema.
+### PDF Bookends Enrichment
+The engine compiles a candidate paper pool from local scraped documents, full-text PDFs, and concurrent external Semantic Scholar and Tavily queries. For all candidate papers featuring valid PDF URLs, a background thread pool downloads the PDF and extracts the Abstract and Conclusion bookends using PyMuPDF and TextChunker, writing them to an enriched `abstract_conclusion` field capped at 8,000 characters.
 
-### 3. Protected Dynamic Bucket Allocation (Stage 3)
-Eligible files are sorted chronologically (newest-first) and mapped into dedicated, protected character budgets to prevent one massive document from starving other categories:
-* **Synthesis Budget (`_SYNTHESIS_BUDGET`)**: `40,000` characters baseline cap. Reserved for Phase 3 syntheses.
-* **Web Scrape Budget (`_WEB_SCRAPE_BUDGET`)**: `80,000` characters baseline cap. Reserved for web scrapers and refined ledgers.
-* **Academic Budget (`_ACADEMIC_BUDGET`)**: `120,000` characters baseline cap. Reserved for open-access PDF full texts.
+### Rubric-Based Semantic Matching (SemanticMatcher.py)
+The core literature validation and scoring logic resides in `infrastructure/SemanticMatcher.py`. The module is responsible for identifying relevant research and filtering out tangential literature:
 
-### 4. Asymmetric Budget Rollover (Stage 4)
-If a high-priority bucket consumes less than its allocated cap, the remaining headroom is rolled over to downstream categories:
-* **Synthesis Rollover**: Any unused synthesis character capacity is rolled over to the **Academic budget first**.
-* **Secondary Rollover**: If the Academic budget is completely satisfied, any remaining rollover is added to the **Web Scrape budget**.
-* **Integrity Packing**: Files are packed as complete blocks. If a file is larger than the remaining budget of its target bucket, the file is omitted entirely from the run rather than being head-truncated, maintaining complete document integrity.
+* **Rubric Scoring (0-10 Scale)**: Gemini 2.5 Flash evaluates each paper's enriched Abstract + Conclusion context against the scoped `core_criteria` according to three strict dimensions:
+  1. **Domain Alignment**: Does the paper operate in the same field or scientific domain?
+  2. **Task Alignment**: Is the paper trying to solve a similar problem, task, or research gap (evaluating BOTH the Abstract's goals AND the Conclusion's actual achievements or limits)?
+  3. **Method Relevance**: Is the methodology, technology, or approach relevant or applicable (evaluating the Conclusion's stated limitations as direct opportunities)?
+* **Score Calculation**: The model calculates the total relevance percentage score in-memory using the formula: `(domain_alignment + task_alignment + method_relevance) / 30 * 100`.
+* **Pydantic Validation**: Flash returns a structured JSON payload validating against the `RubricEvaluation` Pydantic schema, securing the scores and a 1-sentence reasoning justification.
+* **Concurrency Lock**: To maximize throughput while avoiding rate-limiting boundaries, the scoring pipeline runs concurrently via `asyncio.gather` bounded by an `asyncio.Semaphore(5)` lock.
+* **Quota Resilience & Failovers**: Scoring calls utilize `tenacity` retry wrappers with exponential backoffs (`Multiplier=2`, `Min=2s`, `Max=10s`) triggered exclusively on `429 ResourceExhausted` exceptions. If the primary `global` Vertex API endpoint exhausts its quota, the matcher cascades through a sharded stable region pool (`europe-west4`, `us-east4`, `asia-northeast1`, and `us-central1`).
+* **Strict Filtering Threshold**: Only papers scoring **strictly > 75.0%** are retained. The top 15 highest-scoring papers are written to `matched_papers.json` to anchor the literature review.
 
-### 5. Global Character Safety Net (Stage 5)
-Once the dynamic buckets are packed, the entire merged corpus is audited. If the total length exceeds the global cap of **180,000 characters**, an eviction algorithm drops files lowest-priority first until the budget is met:
-1. `_urlrefiner` files and generic `agent_scrapes/`
-2. `academic_fulltext_` documents
-3. Phase 3 synthesis documents (never evicted)
+### Automated Proposal Synthesis
+Using Gemini 2.5 Pro, the engine synthesizes a highly structured academic project proposal. The proposal consumes the scoped definition, gap analysis, and matching papers, outputting to `proposals/proposal_*.md` conforming to a rigid Roman numeral academic template:
+* **I. Executive Summary**: Compelling 2-3 paragraph problem statement and proposed novelty.
+* **II. Project Definition**: Detailed constraints, Task, and Domain boundaries.
+* **III. Matched Literature Review**: Critical assessment of top-scoring Open Access reference papers.
+* **IV. Academic Gap Alignment**: Systematic alignment with diagnosed structural holes, limitations, and orphaned solutions.
+* **V. Proposed Architecture & Methodology**: Separated systematically into *V.A Feature Set* and *V.B Technical Challenges*.
+* **VI. Verification & Execution Plan**: Empirical evaluation strategy.
 
-### 6. Reference Hygiene Validation (Stage 6)
-Any file omitted during Stage 3 (due to bucket caps) or evicted during Stage 5 (safety net) is stripped from the active loading manifests. The python script (`GraphAnalyzer.py`) compares the LLM output array against the list of surviving files. If the model cites a document that did not survive the allocation filters, the citation reference is automatically scrubbed, preventing model hallucinations.
+### Upgraded Workspace Docs Exporter
+The Workspace Exporter (`GoogleWorkspaceManager.py`) converts the generated proposal markdown into a professional native Google Doc via OAuth 2.0 InstalledAppFlow:
+* **Native Paragraph Parsing**: Converts markdown headers (H1-H3), regular text, and bold style ranges (`**text**`) into native Google Doc API formatting requests instead of dumping raw markdown characters.
+* **Tabular Formatting**: Automatically parses Markdown tables into beautifully structured, natively styled Google Doc tables.
+* **Clickable Literature References**: Matches papers in `matched_papers.json` and inserts direct academic hyperlinks to their original online source URLs (arXiv, Semantic Scholar, etc.) inside literature tables.
+* **Reference Materials Section**: Appends a formal **"VII. Reference Materials"** section featuring bulleted links directly to original publications.
 
 ---
 
