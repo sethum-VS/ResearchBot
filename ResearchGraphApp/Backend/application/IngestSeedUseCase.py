@@ -716,6 +716,7 @@ def execute(idea: str, url: str) -> dict:
         current_run_files=current_run_files,
         graph_json_path=graph_json_abs if graph_json_abs.is_file() else None,
         graphify_error=graphify_error,
+        seed_context=seed_analysis,
     )
 
     # Persist gap analysis next to the graph for HistoryView re-rendering.

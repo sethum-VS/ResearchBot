@@ -473,6 +473,235 @@ def _patch_graph_html(html: str, name_map: dict[int, str]) -> str:
     return html
 
 
+# ── Entity Resolution (Semantic Deduplication) ───────────────────────────────────
+
+_ENTITY_RESOLUTION_BATCH_SIZE = 100
+_ENTITY_RESOLUTION_MIN_NODES = 3
+
+_ENTITY_RESOLUTION_REGIONS: list[str] = [
+    "global",
+    "us-central1",
+    "europe-west4",
+    "us-east4",
+]
+
+
+def _call_flash_for_entity_resolution(
+    node_list_text: str,
+    project_id: str,
+) -> dict[str, str]:
+    """
+    Send a single batch of alphabetically sorted node labels to Gemini 2.5 Flash
+    for synonym/co-reference detection. Returns a mapping of duplicate_id → primary_id.
+    Uses global → regional failover.
+    """
+    from google import genai
+
+    prompt = (
+        "You are a graph topology optimizer. Below is an alphabetically sorted "
+        "subset of knowledge graph nodes (ID and label). Identify groups of nodes "
+        "that are semantic duplicates, near-synonyms, or co-references "
+        '(e.g., "LLM" and "Large Language Model", or "EM-LLM" and '
+        '"Human-Inspired Episodic Memory", or "AI Agent" and "AI Agents"). '
+        "For each duplicate group, pick the node with the most descriptive label "
+        "as the primary. Return ONLY a valid JSON object where each key is a "
+        "duplicate node ID (to be removed) and the value is the primary node ID "
+        "it should be merged into. If no duplicates exist, return {}.\n\n"
+        f"{node_list_text}"
+    )
+
+    last_exc: Exception | None = None
+    for region in _ENTITY_RESOLUTION_REGIONS:
+        try:
+            client = genai.Client(
+                vertexai=True, project=project_id, location=region,
+            )
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[prompt],
+            )
+            raw_text = (response.text or "").strip()
+            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text)
+            raw_text = re.sub(r"\s*```$", "", raw_text)
+            if not raw_text:
+                return {}
+            mapping = json.loads(raw_text)
+            if isinstance(mapping, dict):
+                return {str(k): str(v) for k, v in mapping.items()}
+            return {}
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Entity resolution Flash call failed at %s: %s", region, exc,
+            )
+            continue
+
+    logger.error(
+        "Entity resolution failed after all regions. Last error: %s", last_exc,
+    )
+    return {}
+
+
+def _resolve_graph_entities(graph_data: dict) -> dict:
+    """
+    Merge semantically duplicate nodes in the knowledge graph using
+    Gemini 2.5 Flash with alphabetical batching.
+
+    Strategy:
+      1. Sort nodes alphabetically by label (lowercased) so near-synonyms
+         naturally cluster together.
+      2. Chunk into batches of 100 nodes.
+      3. Send each batch to Flash for synonym detection.
+      4. Merge all batch mappings into a master dedup map.
+      5. Rewire graph: delete duplicate nodes, rewrite links, remove
+         self-loops and duplicate edges.
+
+    Gracefully degrades: returns graph_data unmodified on any failure.
+    """
+    nodes = graph_data.get("nodes", [])
+    if len(nodes) < _ENTITY_RESOLUTION_MIN_NODES:
+        return graph_data
+
+    project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
+    if not project_id:
+        logger.warning(
+            "GOOGLE_CLOUD_PROJECT_ID not set; skipping entity resolution.",
+        )
+        return graph_data
+
+    print(
+        f"PROGRESS: Phase 4 — entity resolution: sorting {len(nodes)} nodes "
+        f"alphabetically for batched deduplication...",
+        flush=True,
+    )
+
+    # ── Step 1: Sort nodes alphabetically by label ────────────────────
+    sorted_nodes = sorted(
+        nodes,
+        key=lambda n: (n.get("label") or n.get("id", "")).lower(),
+    )
+
+    # ── Step 2: Chunk into batches ───────────────────────────────────
+    batches: list[list[dict]] = [
+        sorted_nodes[i : i + _ENTITY_RESOLUTION_BATCH_SIZE]
+        for i in range(0, len(sorted_nodes), _ENTITY_RESOLUTION_BATCH_SIZE)
+    ]
+    print(
+        f"PROGRESS: Phase 4 — entity resolution: {len(batches)} batch(es) "
+        f"of up to {_ENTITY_RESOLUTION_BATCH_SIZE} nodes each.",
+        flush=True,
+    )
+
+    # ── Step 3: Send each batch to Flash ─────────────────────────────
+    master_mapping: dict[str, str] = {}
+    node_id_set = {n.get("id") for n in nodes if n.get("id")}
+
+    for batch_idx, batch in enumerate(batches, start=1):
+        node_lines = [
+            f"  ID: {n.get('id', '?')}  |  Label: {n.get('label', '(unlabeled)')}"
+            for n in batch
+        ]
+        node_list_text = "\n".join(node_lines)
+
+        print(
+            f"PROGRESS: Phase 4 — entity resolution batch {batch_idx}/{len(batches)} "
+            f"({len(batch)} nodes)...",
+            flush=True,
+        )
+
+        try:
+            batch_mapping = _call_flash_for_entity_resolution(
+                node_list_text, project_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Entity resolution batch %d failed: %s", batch_idx, exc,
+            )
+            continue
+
+        # Validate: both IDs must exist in the graph
+        for dup_id, primary_id in batch_mapping.items():
+            if dup_id in node_id_set and primary_id in node_id_set:
+                if dup_id != primary_id:
+                    master_mapping[dup_id] = primary_id
+            else:
+                logger.debug(
+                    "Entity resolution: skipping invalid mapping %s → %s",
+                    dup_id, primary_id,
+                )
+
+    if not master_mapping:
+        print(
+            "PROGRESS: Phase 4 — entity resolution: no duplicates found.",
+            flush=True,
+        )
+        return graph_data
+
+    # ── Step 4: Resolve transitive chains (A→B, B→C ⇒ A→C, B→C) ─────
+    def _resolve_primary(node_id: str) -> str:
+        visited: set[str] = set()
+        current = node_id
+        while current in master_mapping and current not in visited:
+            visited.add(current)
+            current = master_mapping[current]
+        return current
+
+    resolved_mapping = {
+        dup: _resolve_primary(dup) for dup in master_mapping
+    }
+    # Remove identity mappings that may arise from transitive resolution
+    resolved_mapping = {
+        k: v for k, v in resolved_mapping.items() if k != v
+    }
+
+    print(
+        f"PROGRESS: Phase 4 — entity resolution: merging "
+        f"{len(resolved_mapping)} duplicate node(s)...",
+        flush=True,
+    )
+
+    # ── Step 5: Rewire the graph ────────────────────────────────────
+    duplicates_to_remove = set(resolved_mapping.keys())
+
+    # 5a. Remove duplicate nodes
+    graph_data["nodes"] = [
+        n for n in graph_data["nodes"]
+        if n.get("id") not in duplicates_to_remove
+    ]
+
+    # 5b. Rewrite link endpoints
+    links = graph_data.get("links", [])
+    for link in links:
+        src = link.get("source", "")
+        tgt = link.get("target", "")
+        if src in resolved_mapping:
+            link["source"] = resolved_mapping[src]
+        if tgt in resolved_mapping:
+            link["target"] = resolved_mapping[tgt]
+
+    # 5c. Remove self-loops
+    links = [lk for lk in links if lk.get("source") != lk.get("target")]
+
+    # 5d. Remove duplicate edges (keep first occurrence)
+    seen_edges: set[tuple[str, str]] = set()
+    deduped_links: list[dict] = []
+    for lk in links:
+        edge_key = (lk.get("source", ""), lk.get("target", ""))
+        if edge_key not in seen_edges:
+            seen_edges.add(edge_key)
+            deduped_links.append(lk)
+    graph_data["links"] = deduped_links
+
+    print(
+        f"PROGRESS: Phase 4 — entity resolution complete: "
+        f"{len(graph_data['nodes'])} nodes, {len(graph_data['links'])} edges "
+        f"(removed {len(duplicates_to_remove)} duplicate(s)).",
+        flush=True,
+    )
+
+    return graph_data
+
+
 # ── Post-Processing Orchestrator ────────────────────────────────────────────
 
 def post_process_artifacts(out_dir: Path) -> None:
@@ -481,8 +710,9 @@ def post_process_artifacts(out_dir: Path) -> None:
     ``graphify-out/`` folder):
 
       1. Inject a resizable sidebar into graph.html.
-      2. Generate intelligent community names via Gemini 2.5 Flash.
-      3. Patch both graph.json and graph.html with the new names.
+      2. Entity resolution: merge semantic duplicates via batched Flash calls.
+      3. Generate intelligent community names via Gemini 2.5 Flash.
+      4. Patch both graph.json and graph.html with the new names.
     """
     out_dir = Path(out_dir)
     html_path = out_dir / "graph.html"
@@ -503,6 +733,20 @@ def post_process_artifacts(out_dir: Path) -> None:
     if json_path.is_file():
         try:
             graph_data = json.loads(json_path.read_text(encoding="utf-8"))
+
+            # ── Entity resolution BEFORE community naming ─────────────
+            try:
+                graph_data = _resolve_graph_entities(graph_data)
+                json_path.write_text(
+                    json.dumps(graph_data, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                logger.warning(
+                    "Entity resolution failed (continuing with original graph): %s", e,
+                )
+
+            # ── Community naming (on deduplicated graph) ───────────────
             degrees = _compute_degrees(graph_data)
             communities = _group_communities(graph_data, degrees)
 

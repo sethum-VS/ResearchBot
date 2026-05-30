@@ -68,7 +68,11 @@ S2_PER_KEYWORD_LIMIT = 10
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 ARXIV_PER_KEYWORD_LIMIT = 10
 ARXIV_ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
-_ARXIV_CIRCUIT_OPEN = False
+ARXIV_REQUEST_TIMEOUT_SEC = 15   # Reduced from 30s — fail fast on slow arXiv
+
+# Time-based half-open circuit breaker (replaces boolean _ARXIV_CIRCUIT_OPEN)
+_ARXIV_CIRCUIT_OPEN_UNTIL = 0.0          # epoch timestamp; 0 = circuit closed
+_ARXIV_CIRCUIT_COOLDOWN_SEC = 120.0      # reset after 2 minutes
 
 ACADEMIC_DOMAINS = ["arxiv.org", "researchgate.net", "scholar.google.com"]
 TAVILY_PER_KEYWORD_LIMIT = 5
@@ -133,6 +137,7 @@ class AcademicSearchResult:
 
 
 def _is_resource_exhausted(exc: Exception) -> bool:
+    """Broad check: any transient / retriable failure (for tenacity retries)."""
     exc_str = str(exc).lower()
     return (
         "429" in exc_str
@@ -141,6 +146,39 @@ def _is_resource_exhausted(exc: Exception) -> bool:
         or "timeout" in exc_str
         or "connection" in exc_str
     )
+
+
+def _is_true_rate_limit(exc: Exception) -> bool:
+    """Strict check: genuine HTTP 429 / rate-exceeded only (for circuit breaker)."""
+    exc_str = str(exc).lower()
+    return (
+        "429" in exc_str
+        or "resourceexhausted" in exc_str
+        or "resource_exhausted" in exc_str
+        or "rate exceeded" in exc_str
+        or "rate limit" in exc_str
+    )
+
+
+def _arxiv_circuit_is_open() -> bool:
+    """Check if the arXiv circuit breaker is currently open (tripped)."""
+    if _ARXIV_CIRCUIT_OPEN_UNTIL <= 0.0:
+        return False
+    if time.time() >= _ARXIV_CIRCUIT_OPEN_UNTIL:
+        # Cooldown elapsed → half-open → allow retry
+        return False
+    return True
+
+
+def _arxiv_trip_circuit() -> None:
+    """Open the arXiv circuit breaker with a time-based cooldown."""
+    global _ARXIV_CIRCUIT_OPEN_UNTIL
+    _ARXIV_CIRCUIT_OPEN_UNTIL = time.time() + _ARXIV_CIRCUIT_COOLDOWN_SEC
+
+
+def _arxiv_429_max_retries() -> int:
+    """Consecutive true-rate-limit failures required before tripping the circuit."""
+    return _env_int("ARXIV_429_MAX_RETRIES", 2)
 
 
 # ── Semantic Expansion Pydantic Schema ─────────────────────────────────────
@@ -749,8 +787,8 @@ _LAST_ARXIV_REQUEST_TIME = 0.0
 
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=5, max=30),
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=2, min=5, max=20),
     retry=retry_if_exception(_is_resource_exhausted),
     reraise=True,
 )
@@ -771,7 +809,7 @@ def _arxiv_search_request(query: str, max_results: int) -> str:
                 "start": 0,
                 "max_results": max_results,
             },
-            timeout=30,
+            timeout=ARXIV_REQUEST_TIMEOUT_SEC,
             headers={"User-Agent": S2_USER_AGENT},
         )
         _LAST_ARXIV_REQUEST_TIME = time.time()
@@ -824,20 +862,20 @@ def _format_arxiv_query_term(kw: str) -> str:
 
 def search_arxiv_papers(keywords: list[str], max_results: int = ARXIV_PER_KEYWORD_LIMIT) -> str:
     """Query arXiv for the top keywords and return a Markdown subsection (## arXiv)."""
-    global _ARXIV_CIRCUIT_OPEN
-    if _ARXIV_CIRCUIT_OPEN:
+    if _arxiv_circuit_is_open():
         return ""
 
     top = _top_keywords(keywords)
     if not top:
         return ""
 
-    # Individual per-keyword queries with strict 1 req/3sec rate limit.
+    # Individual per-keyword queries with strict rate-limited pacing.
     all_papers: list[AcademicPaper] = []
     total = len(top)
+    consecutive_rate_limits = 0
 
     for idx, kw in enumerate(top, 1):
-        if _ARXIV_CIRCUIT_OPEN:
+        if _arxiv_circuit_is_open():
             print(
                 f"PROGRESS: Phase 2 — arXiv [{idx}/{total}] skipped (circuit open).",
                 flush=True,
@@ -852,22 +890,38 @@ def search_arxiv_papers(keywords: list[str], max_results: int = ARXIV_PER_KEYWOR
             xml_text = _arxiv_search_request(query_term, max_results)
             batch = _parse_arxiv_atom(xml_text)
             all_papers.extend(batch)
+            consecutive_rate_limits = 0  # Reset on success
             print(
                 f"PROGRESS: Phase 2 — arXiv [{idx}/{total}] ok ({len(batch)} papers).",
                 flush=True,
             )
         except Exception as exc:
-            if _is_resource_exhausted(exc):
-                _ARXIV_CIRCUIT_OPEN = True
-                remaining = total - idx
+            if _is_true_rate_limit(exc):
+                consecutive_rate_limits += 1
+                if consecutive_rate_limits >= _arxiv_429_max_retries():
+                    _arxiv_trip_circuit()
+                    remaining = total - idx
+                    print(
+                        f"PROGRESS: Phase 2 — arXiv circuit open — skipping "
+                        f"{remaining} remaining query(ies) due to rate limit exhaustion.",
+                        flush=True,
+                    )
+                    logger.warning("arXiv circuit open after %d consecutive 429s: %s", consecutive_rate_limits, exc)
+                else:
+                    print(
+                        f"PROGRESS: Phase 2 — arXiv [{idx}/{total}] rate-limited (429), "
+                        f"will retry next query.",
+                        flush=True,
+                    )
+                    logger.info("arXiv 429 on query %d/%d: %s", idx, total, exc)
+            else:
+                # Timeout / connection error — log and continue, do NOT trip circuit
+                logger.warning("arXiv search failed for query %r (non-429): %s", query_term, exc)
                 print(
-                    f"PROGRESS: Phase 2 — arXiv circuit open — skipping "
-                    f"{remaining} remaining query(ies) due to rate limit exhaustion.",
+                    f"PROGRESS: Phase 2 — arXiv [{idx}/{total}] transient error "
+                    f"(timeout/connection), continuing.",
                     flush=True,
                 )
-                logger.warning("arXiv circuit open after 429 exhaustion: %s", exc)
-            else:
-                logger.warning("arXiv search failed for query %r: %s", query_term, exc)
 
     deduped = _dedupe_arxiv_papers(all_papers)
     if not deduped:
@@ -879,20 +933,20 @@ def _fetch_arxiv_papers_list(
     keywords: list[str],
     max_keyword_slice: int = KEYWORD_SLICE,
 ) -> list[AcademicPaper]:
-    global _ARXIV_CIRCUIT_OPEN
-    if _ARXIV_CIRCUIT_OPEN:
+    if _arxiv_circuit_is_open():
         return []
 
     top = _top_keywords(keywords, max_slice=max_keyword_slice)
     if not top:
         return []
 
-    # Individual per-keyword queries with strict 1 req/3sec rate limit.
+    # Individual per-keyword queries with strict rate-limited pacing.
     all_papers: list[AcademicPaper] = []
     total = len(top)
+    consecutive_rate_limits = 0
 
     for idx, kw in enumerate(top, 1):
-        if _ARXIV_CIRCUIT_OPEN:
+        if _arxiv_circuit_is_open():
             print(
                 f"PROGRESS: Phase 2 — arXiv [{idx}/{total}] skipped (circuit open).",
                 flush=True,
@@ -907,22 +961,38 @@ def _fetch_arxiv_papers_list(
             xml_text = _arxiv_search_request(query_term, ARXIV_PER_KEYWORD_LIMIT)
             batch = _parse_arxiv_atom(xml_text)
             all_papers.extend(batch)
+            consecutive_rate_limits = 0  # Reset on success
             print(
                 f"PROGRESS: Phase 2 — arXiv [{idx}/{total}] ok ({len(batch)} papers).",
                 flush=True,
             )
         except Exception as exc:
-            if _is_resource_exhausted(exc):
-                _ARXIV_CIRCUIT_OPEN = True
-                remaining = total - idx
+            if _is_true_rate_limit(exc):
+                consecutive_rate_limits += 1
+                if consecutive_rate_limits >= _arxiv_429_max_retries():
+                    _arxiv_trip_circuit()
+                    remaining = total - idx
+                    print(
+                        f"PROGRESS: Phase 2 — arXiv circuit open — skipping "
+                        f"{remaining} remaining query(ies) due to rate limit exhaustion.",
+                        flush=True,
+                    )
+                    logger.warning("arXiv circuit open after %d consecutive 429s: %s", consecutive_rate_limits, exc)
+                else:
+                    print(
+                        f"PROGRESS: Phase 2 — arXiv [{idx}/{total}] rate-limited (429), "
+                        f"will retry next query.",
+                        flush=True,
+                    )
+                    logger.info("arXiv 429 on query %d/%d: %s", idx, total, exc)
+            else:
+                # Timeout / connection error — log and continue, do NOT trip circuit
+                logger.warning("arXiv search failed for query %r (non-429): %s", query_term, exc)
                 print(
-                    f"PROGRESS: Phase 2 — arXiv circuit open — skipping "
-                    f"{remaining} remaining query(ies) due to rate limit exhaustion.",
+                    f"PROGRESS: Phase 2 — arXiv [{idx}/{total}] transient error "
+                    f"(timeout/connection), continuing.",
                     flush=True,
                 )
-                logger.warning("arXiv circuit open after 429 exhaustion: %s", exc)
-            else:
-                logger.warning("arXiv search failed for query %r: %s", query_term, exc)
 
     return _dedupe_arxiv_papers(all_papers)
 

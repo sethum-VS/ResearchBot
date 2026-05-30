@@ -78,6 +78,10 @@ _CorpusEntry = tuple[Path, str, str]  # path, filename, delimited block
 
 _SHARED_CONTEXT = """You are an Academic Graph Analyzer helping university students discover Final Year Project (FYP) research gaps.
 
+--- USER RESEARCH INTENT ---
+Core Topic: {core_topic}
+User Intent: {user_intent}
+
 You will receive TWO inputs:
 
   (A) The COMPLETE knowledge-graph topology (every node, every edge, every community).
@@ -85,82 +89,84 @@ You will receive TWO inputs:
 
 Cross-reference topology against the source text. Every claim MUST cite exact filename(s) in `references` from the SOURCE DOCUMENTS section only. If a signal cannot be grounded, omit that entry.
 
+CRITICAL DIRECTIVE: You must analyze the topology and documents specifically through the lens of the User Research Intent above. Prioritize gaps, limitations, and solutions that are directly relevant to solving the user's core topic. Do not highlight generic academic gaps that do not serve the user's specific research goal.
+
 Rules for `references`:
   - Use ONLY filenames from SOURCE DOCUMENTS. Do not invent or rename them.
   - Include 1-4 strongest supporting filenames per entry.
 """
 
-_PROMPT_STRUCTURAL_HOLES = f"""{_SHARED_CONTEXT}
-
-Analyze ONLY for **Structural Holes** — disconnected or loosely connected communities (e.g., societal-problem cluster vs. technology cluster with few bridging edges). For each hole: name communities involved, explain the disconnect using source evidence, and suggest a bridging FYP angle.
+_PROMPT_STRUCTURAL_HOLES = _SHARED_CONTEXT + """
+Analyze ONLY for **Structural Holes** — disconnected or loosely connected communities (e.g., societal-problem cluster vs. technology cluster with few bridging edges). For each hole: name communities involved, explain the disconnect using source evidence, and suggest a bridging FYP angle. Focus on bridging opportunities that directly serve the student's proposed project described in the USER RESEARCH INTENT.
 
 Return ONLY valid JSON (no markdown fences) with this shape:
 
-{{
+{{{{
   "structural_holes": [
-    {{
+    {{{{
       "title": "short title",
       "communities_involved": ["community A", "community B"],
       "description": "why this is a structural hole, source-grounded",
       "bridging_opportunity": "concrete FYP angle",
       "references": ["exact_filename_1.md"]
-    }}
+    }}}}
   ]
-}}
+}}}}
 
-If no defensible structural holes exist, return {{"structural_holes": []}}. Be specific to this graph — no generic advice.
+If no defensible structural holes exist, return {{{{"structural_holes": []}}}}. Be specific to this graph — no generic advice.
 """
 
-_PROMPT_HIGH_DEGREE = f"""{_SHARED_CONTEXT}
-
-Analyze ONLY for **High-Degree Limitation Nodes** — limitation/challenge/weakness nodes (e.g., latency, privacy, scalability) with multiple incoming edges from different sources. Confirm in source text that gaps are multi-source validated, not single-paper opinions.
+_PROMPT_HIGH_DEGREE = _SHARED_CONTEXT + """
+Analyze ONLY for **High-Degree Limitation Nodes** — limitation/challenge/weakness nodes (e.g., latency, privacy, scalability) with multiple incoming edges from different sources. Confirm in source text that gaps are multi-source validated, not single-paper opinions. Confirm limitations are validated across multiple sources AND are relevant to the user's stated research intent.
 
 Return ONLY valid JSON (no markdown fences) with this shape:
 
-{{
+{{{{
   "high_degree_limitations": [
-    {{
+    {{{{
       "title": "limitation theme",
       "node_labels": ["label1", "label2"],
       "degree": 0,
       "description": "why this is a validated multi-source gap",
       "evidence": "quote, paraphrase, or pattern across cited sources",
       "references": ["exact_filename_1.md"]
-    }}
+    }}}}
   ]
-}}
+}}}}
 
-If none exist, return {{"high_degree_limitations": []}}. Be specific to this graph.
+If none exist, return {{{{"high_degree_limitations": []}}}}. Be specific to this graph.
 """
 
-_PROMPT_ORPHANED = f"""{_SHARED_CONTEXT}
-
-Analyze ONLY for **Orphaned Solutions** — solution/method nodes whose outgoing edges point to failure conditions, drawbacks, or "fails when X". Verify failures in source text; describe a concrete technical FYP contribution.
+_PROMPT_ORPHANED = _SHARED_CONTEXT + """
+Analyze ONLY for **Orphaned Solutions** — solution/method nodes whose outgoing edges point to failure conditions, drawbacks, or "fails when X". Verify failures in source text; describe a concrete technical FYP contribution that addresses the user's core topic.
 
 Return ONLY valid JSON (no markdown fences) with this shape:
 
-{{
+{{{{
   "orphaned_solutions": [
-    {{
+    {{{{
       "title": "solution node label",
       "failure_conditions": ["condition 1", "condition 2"],
       "description": "why the solution is undermined in the literature",
       "technical_contribution": "what an FYP could build or fix",
       "references": ["exact_filename_1.md"]
-    }}
+    }}}}
   ]
-}}
+}}}}
 
-If none exist, return {{"orphaned_solutions": []}}. Be specific to this graph.
+If none exist, return {{{{"orphaned_solutions": []}}}}. Be specific to this graph.
 """
 
 _SUMMARY_PROMPT = """You are summarizing academic graph gap analysis for a university FYP student.
 
+The student's research topic is: {core_topic}
+Their intent: {user_intent}
+
 You will receive a digest of structural holes, high-degree limitations, and orphaned solutions already extracted from their research graph.
 
-Write a 2-4 sentence executive summary covering the single most actionable FYP angle. Be concrete; do not repeat every item.
+Write a 2-4 sentence executive summary covering the single most actionable FYP angle specifically for the student's topic. Be concrete; do not repeat every item. Anchor your summary to the student's stated research intent.
 
-Return ONLY valid JSON: {"summary": "your 2-4 sentences here"}
+Return ONLY valid JSON: {{"summary": "your 2-4 sentences here"}}
 """
 
 _SYSTEM_INSTRUCTION = (
@@ -903,13 +909,27 @@ async def _generate_executive_summary_async(
     high_degree_limitations: list[dict[str, Any]],
     orphaned_solutions: list[dict[str, Any]],
     topology_stats: str,
+    seed_context: dict[str, Any] | None = None,
 ) -> str:
     """Lightweight fourth call — small payload, fast summary synthesis."""
+    core_topic = (
+        seed_context.get("core_context", "General FYP Research")
+        if seed_context
+        else "General FYP Research"
+    )
+    user_intent = (
+        seed_context.get("user_intent", "General Inquiry")
+        if seed_context
+        else "General Inquiry"
+    )
+    formatted_summary_prompt = _SUMMARY_PROMPT.format(
+        core_topic=core_topic, user_intent=user_intent,
+    )
     digest = _build_findings_digest(
         structural_holes, high_degree_limitations, orphaned_solutions
     )
     contents = [
-        f"{_SUMMARY_PROMPT}\n\n"
+        f"{formatted_summary_prompt}\n\n"
         f"--- FINDINGS DIGEST ---\n{digest}\n\n"
         f"--- TOPOLOGY STATS ---\n{topology_stats}"
     ]
@@ -1003,6 +1023,7 @@ def _merge_analysis_results(
 async def _run_map_reduce_analysis_async(
     graph_data: dict,
     current_run_files: Iterable[Path],
+    seed_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Concurrent Map-Reduce over three gap categories + executive summary."""
     print(
@@ -1010,6 +1031,35 @@ async def _run_map_reduce_analysis_async(
         "+ executive summary...",
         flush=True,
     )
+
+    # ── Extract seed context for prompt anchoring ────────────────────────
+    core_topic = (
+        seed_context.get("core_context", "General FYP Research")
+        if seed_context
+        else "General FYP Research"
+    )
+    user_intent = (
+        seed_context.get("user_intent", "General Inquiry")
+        if seed_context
+        else "General Inquiry"
+    )
+    print(
+        f"PROGRESS: Phase 4.5 — seed context anchored: "
+        f"topic={core_topic[:80]!r}, intent={user_intent[:60]!r}",
+        flush=True,
+    )
+
+    # Format prompts with the user's research intent
+    formatted_structural = _PROMPT_STRUCTURAL_HOLES.format(
+        core_topic=core_topic, user_intent=user_intent,
+    )
+    formatted_high_degree = _PROMPT_HIGH_DEGREE.format(
+        core_topic=core_topic, user_intent=user_intent,
+    )
+    formatted_orphaned = _PROMPT_ORPHANED.format(
+        core_topic=core_topic, user_intent=user_intent,
+    )
+
     topology_block = _build_topology_summary(graph_data)
     source_block, filenames = await _load_source_corpus_async(current_run_files)
     allowed = set(filenames)
@@ -1024,21 +1074,21 @@ async def _run_map_reduce_analysis_async(
     map_tasks = [
         _analyze_category_async(
             "structural_holes",
-            _PROMPT_STRUCTURAL_HOLES,
+            formatted_structural,
             topology_block,
             source_block,
             allowed,
         ),
         _analyze_category_async(
             "high_degree_limitations",
-            _PROMPT_HIGH_DEGREE,
+            formatted_high_degree,
             topology_block,
             source_block,
             allowed,
         ),
         _analyze_category_async(
             "orphaned_solutions",
-            _PROMPT_ORPHANED,
+            formatted_orphaned,
             topology_block,
             source_block,
             allowed,
@@ -1082,6 +1132,7 @@ async def _run_map_reduce_analysis_async(
         high_degree_limitations,
         orphaned_solutions,
         _topology_stats_line(graph_data),
+        seed_context=seed_context,
     )
 
     return _merge_analysis_results(
@@ -1098,6 +1149,7 @@ def analyze_graph_topology(
     current_run_files: Iterable[Path] | None = None,
     graph_json_path: Path | None = None,
     graphify_error: str | None = None,
+    seed_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Phase 4.5 entry point (sync wrapper around asyncio Map-Reduce).
@@ -1133,7 +1185,9 @@ def analyze_graph_topology(
 
     try:
         result = asyncio.run(
-            _run_map_reduce_analysis_async(graph_data, current_run_files or [])
+            _run_map_reduce_analysis_async(
+                graph_data, current_run_files or [], seed_context=seed_context,
+            )
         )
         if topology_warning:
             result["error"] = topology_warning
