@@ -18,6 +18,8 @@ from google import genai
 from google.genai import types
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception
 
+import json
+
 logger = logging.getLogger(__name__)
 
 _STABLE_REGIONS: list[str] = [
@@ -271,6 +273,95 @@ def _call_pro_with_retry(
     return response.text
 
 
+
+_PROPOSAL_CRITIC_PROMPT = """Grade this proposal. 
+1. Does it strictly follow the Roman numeral format (I - VI)? 
+2. Are the 'Core Features' actually solving the user's specific problem? 
+3. Does the Literature Matrix contain real limitations? 
+Output a JSON object: {"passed": boolean, "feedback": "Specific instructions for revision if failed"}.
+
+--- USER SCOPED IDEA ---
+{scoped_idea}
+
+--- DRAFT PROPOSAL ---
+{draft}
+"""
+
+
+def generate_draft(system_instruction: str, content_prompt: str, project_id: str) -> str:
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        max_output_tokens=_MAX_OUTPUT_TOKENS,
+    )
+    last_exc: Exception | None = None
+
+    try:
+        client = genai.Client(vertexai=True, project=project_id, location="global")
+        result = _call_pro_with_retry(client, [content_prompt], config)
+        return result
+    except Exception as exc:
+        logger.warning("ProposalSynthesizer generator global failed: %s", exc)
+        last_exc = exc
+
+    for region in _STABLE_REGIONS:
+        try:
+            client = genai.Client(vertexai=True, project=project_id, location=region)
+            result = _call_pro_with_retry(client, [content_prompt], config)
+            return result
+        except Exception as exc:
+            logger.warning("ProposalSynthesizer generator region %s failed: %s", region, exc)
+            last_exc = exc
+
+    raise RuntimeError(f"ProposalSynthesizer generator all regions exhausted. Last error: {last_exc}")
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=2, min=2, max=10),
+    retry=retry_if_exception(_is_resource_exhausted),
+)
+def _call_flash_critic(
+    client: genai.Client,
+    prompt: str,
+    config: types.GenerateContentConfig,
+) -> str:
+    """Gemini 2.5 Flash critic call with tenacity retry on 429."""
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[prompt],
+        config=config,
+    )
+    if not response or not response.text:
+        raise RuntimeError("Gemini 2.5 Flash returned an empty critic response.")
+    return response.text
+
+
+def evaluate_draft(draft: str, scoped_idea: str, project_id: str) -> dict:
+    prompt = _PROPOSAL_CRITIC_PROMPT.format(scoped_idea=scoped_idea, draft=draft)
+    config = types.GenerateContentConfig(response_mime_type="application/json")
+    last_exc: Exception | None = None
+
+    try:
+        client = genai.Client(vertexai=True, project=project_id, location="global")
+        raw = _call_flash_critic(client, prompt, config)
+        return json.loads(raw)
+    except Exception as exc:
+        logger.warning("ProposalSynthesizer critic global failed: %s", exc)
+        last_exc = exc
+
+    for region in _STABLE_REGIONS:
+        try:
+            client = genai.Client(vertexai=True, project=project_id, location=region)
+            raw = _call_flash_critic(client, prompt, config)
+            return json.loads(raw)
+        except Exception as exc:
+            logger.warning("ProposalSynthesizer critic region %s failed: %s", region, exc)
+            last_exc = exc
+
+    logger.warning("ProposalSynthesizer critic exhausted all regions, bypassing.")
+    return {"passed": True, "feedback": ""}
+
+
 def synthesize_proposal(
     scoped_idea: str,
     matched_papers: list[dict],
@@ -278,79 +369,38 @@ def synthesize_proposal(
     avoid_ai_rules: str | None = None,
 ) -> str:
     """
-    Generate a full academic proposal via a single Gemini 2.5 Pro call.
-
-    Args:
-        scoped_idea: The Task/Domain/Constraint scoped query.
-        matched_papers: List of paper dicts with match_score, title, abstract, etc.
-        gap_analysis: The session's academic_gap_analysis dict.
-        avoid_ai_rules: Optional override for AvoidBeingAI.md text.
-
-    Returns:
-        Clean Markdown string of the complete proposal.
-
-    Raises:
-        RuntimeError: If all regions are exhausted.
+    Generate a full academic proposal via Gemini 2.5 Pro with a Critic Loop.
     """
     project_id = os.getenv("GOOGLE_CLOUD_PROJECT_ID")
     if not project_id:
-        raise RuntimeError(
-            "GOOGLE_CLOUD_PROJECT_ID not set. Cannot synthesize proposal."
-        )
+        raise RuntimeError("GOOGLE_CLOUD_PROJECT_ID not set. Cannot synthesize proposal.")
 
     if avoid_ai_rules is None:
         avoid_ai_rules = _load_avoid_ai_rules()
 
     system_instruction = _build_system_instruction(avoid_ai_rules)
-    content_prompt = _build_content_prompt(scoped_idea, matched_papers, gap_analysis)
+    base_content_prompt = _build_content_prompt(scoped_idea, matched_papers, gap_analysis)
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        max_output_tokens=_MAX_OUTPUT_TOKENS,
-    )
+    current_prompt = base_content_prompt
+    MAX_RETRIES = 2
+    draft = ""
 
-    last_exc: Exception | None = None
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt == 0:
+            print("PROGRESS: Phase 5.5 — synthesizing proposal via Gemini 2.5 Pro...", flush=True)
+        draft = generate_draft(system_instruction, current_prompt, project_id)
+        
+        evaluation = evaluate_draft(draft, scoped_idea, project_id)
+        passed = evaluation.get("passed", True)
+        
+        if passed:
+            print("PROGRESS: Phase 5.5 — ✓ proposal synthesis complete and passed critic.", flush=True)
+            return draft
+        else:
+            feedback = evaluation.get("feedback", "No specific feedback provided.")
+            print(f"PROGRESS: Phase 5.5 — Critic rejected Draft V{attempt + 1}. Generating revision...", flush=True)
+            current_prompt = f"{base_content_prompt}\n\nCRITIC FEEDBACK FOR REVISION:\n{feedback}"
+    
+    print("PROGRESS: Phase 5.5 — ✓ proposal synthesis max retries reached, returning last draft.", flush=True)
+    return draft
 
-    # Primary: global endpoint
-    try:
-        print(
-            "PROGRESS: Phase 5 — synthesizing proposal via Gemini 2.5 Pro (global)...",
-            flush=True,
-        )
-        client = genai.Client(vertexai=True, project=project_id, location="global")
-        result = _call_pro_with_retry(client, [content_prompt], config)
-        print("PROGRESS: Phase 5 — ✓ proposal synthesis complete.", flush=True)
-        return result
-    except Exception as exc:
-        logger.warning(
-            "ProposalSynthesizer: global endpoint failed (%s). Trying regions...",
-            exc,
-        )
-        last_exc = exc
-
-    # Regional failover
-    for region in _STABLE_REGIONS:
-        try:
-            print(
-                f"PROGRESS: Phase 5 — synthesis failover → {region}...",
-                flush=True,
-            )
-            client = genai.Client(
-                vertexai=True, project=project_id, location=region
-            )
-            result = _call_pro_with_retry(client, [content_prompt], config)
-            print(
-                f"PROGRESS: Phase 5 — ✓ proposal synthesis complete (via {region}).",
-                flush=True,
-            )
-            return result
-        except Exception as exc:
-            logger.warning(
-                "ProposalSynthesizer: region %s failed: %s", region, exc
-            )
-            last_exc = exc
-            continue
-
-    raise RuntimeError(
-        f"ProposalSynthesizer: all regions exhausted. Last error: {last_exc}"
-    )

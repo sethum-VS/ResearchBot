@@ -94,10 +94,13 @@ PIPELINE_LOG="$(mktemp)"
 set +e
 # Redirect to log (avoid tee pipe hang when the shell wrapper keeps stdout open).
 # Line-buffered pipeline stdout so the sandbox log updates during long runs.
+touch "$PIPELINE_LOG"
+tail -f "$PIPELINE_LOG" &
+TAIL_PID=$!
 stdbuf -oL ./execute_pipeline.sh --idea "AI Agents for Automated Code Review" >"$PIPELINE_LOG" 2>&1
 PIPELINE_EXIT=$?
+kill $TAIL_PID 2>/dev/null || true
 set -e
-cat "$PIPELINE_LOG"
 
 if [ "$PIPELINE_EXIT" -ne 0 ]; then
     echo "❌ Pipeline exited with code $PIPELINE_EXIT"

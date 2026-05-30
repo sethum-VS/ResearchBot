@@ -17,6 +17,12 @@ import fitz
 import requests
 from requests import exceptions as requests_exceptions
 
+# Suppress verbose C-level console output from the underlying MuPDF engine
+try:
+    fitz.TOOLS.mupdf_display_errors(False)
+    fitz.TOOLS.mupdf_display_warnings(False)
+except AttributeError:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -155,17 +161,24 @@ def _parse_pdf_bytes(
     if not pdf_bytes:
         return ""
     try:
-        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-            if full_document:
-                text = _extract_all_pages_text(doc)
-            else:
-                text = _extract_partial_pages_text(doc)
-    except fitz.FileDataError as exc:
-        logger.warning("PdfExtractor: invalid PDF data for %s: %s", url, exc)
-        return ""
-    except Exception as exc:
-        logger.warning("PdfExtractor: parse failed for %s: %s", url, exc)
-        return ""
+        try:
+            with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+                if full_document:
+                    text = _extract_all_pages_text(doc)
+                else:
+                    text = _extract_partial_pages_text(doc)
+        except fitz.FileDataError as exc:
+            logger.warning("PdfExtractor: invalid PDF data for %s: %s", url, exc)
+            return ""
+        except Exception as exc:
+            logger.warning("PdfExtractor: parse failed for %s: %s", url, exc)
+            return ""
+    finally:
+        # Periodic cleanup of MuPDF internal error/warning queue to prevent memory growth
+        try:
+            fitz.TOOLS.reset_mupdf_warnings()
+        except AttributeError:
+            pass
 
     if not text:
         return ""

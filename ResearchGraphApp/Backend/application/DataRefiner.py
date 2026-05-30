@@ -37,9 +37,10 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 logger = logging.getLogger(__name__)
 
 REFINER_SYSTEM_INSTRUCTION = (
-    "You are an Academic Data Refiner. Ingest the provided corpus. Your primary goal is to preserve data lineage. "
-    "web and social media data. Your task is to: "
-    "1. Remove all advertisements, off-topic rants, and irrelevant marketing fluff. "
+    "You are an Academic Data Refiner and Academic Rigor Critic. Ingest the provided corpus. Your primary goal is to preserve data lineage. "
+    "Your task is to: "
+    "1. Before summarizing a source, internally score it (0-10) based on methodological value and factual density. "
+    "If a source appears to be corporate marketing, SEO fluff, or lacks verifiable evidence (Rigor Score < 5), you must completely discard it and omit it from the refined ledger. "
     "2. Verify facts against the provided academic context. "
     "3. Re-organize the useful data into a clean Markdown format, tagging every "
     "section with its origin (e.g., [Source: X/Twitter]). "
@@ -49,7 +50,6 @@ REFINER_SYSTEM_INSTRUCTION = (
     "For every finding, you MUST maintain the [Source: Origin] tag. If the input exceeds 500,000 tokens, "
     "prioritize sections relevant to 'Methodological Weaknesses' and 'Future Work'. "
     "Output a clean, structured Markdown summary that does not exceed 60,000 tokens."
-
 )
 
 

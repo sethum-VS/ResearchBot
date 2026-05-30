@@ -37,8 +37,8 @@ The workbench also provides **workspace run isolation** (every execution writes 
 ### Data Ingestion APIs
 
 * **Firecrawl** — Local Docker container for deep web crawling (`/crawl`, `/scrape`)
-* **Semantic Scholar API** — Academic Graph `/paper/search` (primary academic metadata in Phase 2); optional `SEMANTIC_SCHOLAR_API_KEY` via `x-api-key` header (keyless shared pool with User-Agent). Rate-paced like arXiv: `Retry-After` on 429, bounded retries, circuit breaker; failures are non-fatal (arXiv + Tavily still run)
-* **arXiv API** — Atom export API (`export.arxiv.org`) for CS/FYP preprints; rate-paced multi-keyword queries
+* **Semantic Scholar API** — Academic Graph `/paper/search` (primary academic metadata in Phase 2); optional `SEMANTIC_SCHOLAR_API_KEY` via `x-api-key` header (keyless shared pool with User-Agent). Individual per-keyword queries with strict **1 request/second** rate limit; `Retry-After` on 429, bounded retries, circuit breaker; failures are non-fatal (arXiv + Tavily still run)
+* **arXiv API** — Atom export API (`export.arxiv.org`) for CS/FYP preprints; individual per-keyword queries with strict **1 request/5 seconds** rate limit; `tenacity` retries + circuit breaker
 * **Tavily API** — Social leads (Reddit/X); academic domain search on `arxiv.org`, `researchgate.net`, `scholar.google.com` (merged with S2 + arXiv in `AcademicScraper.py`)
 * **MediaWiki API** — Foundational definitions and Wiki context
 * **PyMuPDF (`pymupdf`)** — In-memory PDF text extraction via `PdfExtractor.py` (partial pages for legacy path; **full document** for Phase 2.2 triage; **Abstract + Conclusion** bookends extraction for Phase 5 candidate scoring)
@@ -166,39 +166,42 @@ All on-disk outputs below are relative to the **active session directory**:
 
 #### Academic discovery (`AcademicScraper.py`)
 
-Multi-keyword expansion uses the **top 3** unique `search_keywords` per source:
+Multi-keyword expansion uses the **top 5** LLM-generated `search_queries` (from Phase 2.2 Semantic Expansion) per source:
 
-| Source | Per keyword | Post-merge |
+| Source | Per query | Post-merge |
 |--------|-------------|------------|
-| **Semantic Scholar** | 10 papers (`/paper/search`) | Dedupe by `paperId` / normalized title; `S2_KEYWORD_DELAY_SEC` (default 3s) between keyword calls; 429 handling honors `Retry-After`, bounded retries (`S2_429_MAX_RETRIES`), optional circuit breaker (`S2_CIRCUIT_BREAKER`) skips remaining S2 keywords while arXiv/Tavily continue |
-| **arXiv** | 10 papers (Atom API) | Dedupe by arXiv ID; `ARXIV_REQUEST_DELAY_SEC` (default 3s) between keyword calls |
+| **Semantic Scholar** | 10 papers (`/paper/search`) | Dedupe by `paperId` / normalized title; Individual queries with strict **1 req/sec** rate limit (thread-safe `_S2_LOCK`). `tenacity` retries with exponential backoff on 429. Circuit breaker (`S2_CIRCUIT_BREAKER`) skips remaining S2 queries after consecutive 429 exhaustion while arXiv/Tavily continue. |
+| **arXiv** | 10 papers (Atom API) | Dedupe by arXiv ID; Individual queries with strict **1 req/5sec** rate limit (thread-safe `_ARXIV_LOCK`). `tenacity` for retries with exponential backoff and automated circuit breaker on 429. |
 | **Tavily** (academic domains) | 5 results | Dedupe by URL |
 
 **Cross-source deduplication:** arXiv and Tavily rows that match an existing S2 paper (arXiv ID or title) are dropped so the metadata scrape does not duplicate the same work.
 
-**Orchestration order (single Academic thread):** Semantic Scholar → arXiv → Tavily (sequential, not parallel across academic APIs). After merge and dedup, stdout reports `Academic sources (after dedup): S2=…, arXiv=…, Tavily=…`.
+**Orchestration order:** S2 and arXiv run in **parallel threads** (each with its own independent rate limiter lock); Tavily runs sequentially after both complete. After merge and dedup, stdout reports `Academic sources (after dedup): S2=…, arXiv=…, Tavily=…`.
 
-#### Semantic Scholar rate-limit protocol (`AcademicScraper.py`)
+#### API Resilience & Rate-Limit Protocols (`AcademicScraper.py`)
 
-Mirrors arXiv pacing; does **not** use blind multi-retry loops on 429.
+Employs strict rate limiting and resilience patterns across academic sources to prevent pipeline failure.
 
 | Step | Behavior |
 |------|----------|
-| **Keyword loop** | Top 3 keywords; `S2_KEYWORD_DELAY_SEC` (default 3s) before keywords 2 and 3 |
-| **Per-keyword request** | `_s2_search_request()` — enhanced query (`{keyword} research paper methodology findings`); on 2nd+ 429 retry, retries with **plain keyword only** |
-| **429 backoff** | Honor `Retry-After` header (seconds or HTTP-date); else default wait 10s keyless / 3s keyed; up to `S2_429_MAX_RETRIES` (default 2) per keyword |
-| **5xx** | At most one extra retry after 2s |
-| **Circuit breaker** | When `S2_CIRCUIT_BREAKER=true` (default), after 429 exhaustion on any keyword, skip remaining S2 keywords for the run; emit PROGRESS with optional API-key hint |
-| **Logging** | Expected 429s log at `info` (not `warning`); unrecoverable non-429 errors stay at `warning` |
-| **Partial success** | Papers from successful keywords are kept; arXiv and Tavily always run afterward |
+| **S2 Rate Limit** | Strict 1 request/second via `_S2_LOCK` + `_LAST_S2_REQUEST_TIME` guard. Individual per-keyword queries (not boolean batching — S2's `/paper/search` does not support boolean operators). |
+| **arXiv Rate Limit** | Strict 1 request/5 seconds via `_ARXIV_LOCK` + `_LAST_ARXIV_REQUEST_TIME` guard. Individual per-keyword queries with `_format_arxiv_query_term()` for each expanded query. |
+| **Parallel Execution** | S2 and arXiv run in parallel threads (`ThreadPoolExecutor`, 2 workers); each thread's queries are sequential within its own rate limiter. Tavily runs sequentially after both complete. |
+| **S2 429 backoff** | `tenacity` retries with exponential backoff (3-15s). Honors `Retry-After` header; defaults to 10s keyless / 3s keyed. |
+| **S2 Circuit breaker** | When `S2_CIRCUIT_BREAKER=true`, after 2 consecutive 429 exhaustions, skips remaining S2 queries for the run; emits PROGRESS with optional API-key hint. |
+| **arXiv Circuit breaker** | On first 429, sets `_ARXIV_CIRCUIT_OPEN = True` and skips remaining arXiv queries. |
+| **Logging & Partial Success** | 429s logged at `info`; unrecoverable errors at `warning`. Papers from successful queries are always kept. |
 
 **Example PROGRESS (degraded keyless run):**
 
 ```
-PROGRESS: Phase 2 — Semantic Scholar [1/3] ok (10 papers).
-PROGRESS: Phase 2 — Semantic Scholar [2/3] rate-limited (429) after backoff.
-PROGRESS: Phase 2 — Semantic Scholar circuit open — skipping 1 remaining keyword(s). arXiv and Tavily will still supply academic metadata. Set SEMANTIC_SCHOLAR_API_KEY in .env for dedicated 1 RPS.
-PROGRESS: Phase 2 — Academic sources (after dedup): S2=10, arXiv=26, Tavily=12 papers.
+PROGRESS: Phase 2 — Semantic Scholar [1/5] ok (10 papers).
+PROGRESS: Phase 2 — Semantic Scholar [2/5] ok (8 papers).
+PROGRESS: Phase 2 — Semantic Scholar [3/5] rate-limited (429). Set SEMANTIC_SCHOLAR_API_KEY in .env for dedicated 1 RPS.
+PROGRESS: Phase 2 — Semantic Scholar circuit open — skipping 2 remaining query(ies). arXiv and Tavily will still supply academic metadata.
+PROGRESS: Phase 2 — arXiv [1/5] ok (10 papers).
+PROGRESS: Phase 2 — arXiv [2/5] ok (9 papers).
+PROGRESS: Phase 2 — Academic sources (after dedup): S2=18, arXiv=19, Tavily=12 papers.
 ```
 
 **Return type:** `AcademicSearchResult` dataclass:
@@ -212,18 +215,20 @@ class AcademicSearchResult:
 
 Each `FullTextArtifact` carries `triage_id`, `title`, `url`, `pdf_url`, `body` (full text), and `source`.
 
-### Phase 2.2: Academic Full-Text Triage (inside Academic thread)
+### Phase 2.2: Two-Tiered Academic Full-Text Triage (inside Academic thread)
 
 Runs **after** metadata merge, **before** Phase 2.5. Full-text papers bypass `DataRefiner` and are registered in `current_run_files` for **Phase 4** and **Phase 4.5** only (not Phase 3 synthesis).
 
+This phase uses a rigorous, multi-tiered filtration pipeline to dramatically reduce API density and token usage while improving relevance:
+
 | Step | Detail |
 |------|--------|
-| **1. OA pool** | All deduped papers with a non-empty `pdf_url` (S2 `openAccessPdf`, arXiv `/pdf/` links, arXiv abs URLs normalized) |
-| **2. Pool cap** | Citation-sorted; max `ACADEMIC_TRIAGE_POOL_MAX` (default 25) sent to Flash |
-| **3. Triage** | `triage_top_papers()` — Gemini 2.5 Flash (`genai.Client`, global + `STABLE_REGIONS` failover) |
-| **Prompt contract** | Evaluate titles/abstracts vs keywords; **only** papers with `pdf_url`; return JSON array of exact `triage_id` strings (`s2:…`, `arxiv:…`, `url:…`) |
-| **4. Selection** | Up to 5 Flash picks; **backfill** candidates from OA pool (up to `_FULLTEXT_TARGET + 3` unique PDF URLs, default 8 attempts) |
-| **5. Full PDF I/O** | `ThreadPoolExecutor` (`_PDF_EXTRACT_WORKERS = 5`); `PdfExtractor.extract_full_text_from_url` (all pages); stops after 5 successful extractions (does not download the entire backfill pool) |
+| **0. Semantic Expansion** | Flash generates 5 specialized search queries and a 2-sentence `core_criteria` derived from `primary_keyword` and `user_intent`. |
+| **1. Mega-Pool Fetch** | Fetch from S2/arXiv/Tavily using the expanded semantic queries, building a large pool of 50-80 candidate papers. |
+| **2. Tier 1 Scoring** | **Semantic Matcher**: Scores every paper (Abstract only) against the `core_criteria`. Applies a strict > 75% threshold. Papers below 75% are immediately discarded to save bandwidth. |
+| **3. Bookend Extraction** | **Tier 1.5**: Only for the highly-relevant surviving papers, a concurrent pool extracts their Abstract + Conclusion bookends. |
+| **4. Triage Critic** | **Tier 2**: The top 15 bookend-enriched papers are evaluated by the Triage Critic, which selects the absolute best 5 papers. |
+| **5. Full PDF I/O** | `ThreadPoolExecutor` downloads the complete full-text PDF (all pages) for the 5 selected papers. |
 | **6. Persist** | Orchestrator writes `processed_summaries/academic_fulltext_{triage_id}_{timestamp}.md` |
 
 **Stdout examples:**
@@ -254,8 +259,10 @@ Both use `requests` with `timeout=(5, 15)` (connect 5s, read 15s), in-memory dow
 | **Module** | `DataRefiner.refine_scraped_data(raw_corpus)` |
 | **Model** | Gemini 2.5 Pro (`max_output_tokens=65536`) |
 | **Input** | In-memory corpus only: `web_md`, `social_md`, `wiki_md`, `academic_md` (metadata from `academic_scrape.md`), `deep_crawl_md` — **excludes** Phase 2.2 `academic_fulltext_*.md` |
+| **Academic Rigor Critic** | Before summarizing a source, the model acts as an Academic Rigor Critic to internally score each source (0-10) based on methodological value and factual density. Sources identified as corporate marketing, SEO fluff, or lacking verifiable evidence (Rigor Score < 5) are completely discarded. |
 | **Output** | Clean Markdown research ledger in `agent_scrapes/`; section **"High-Value URLs for Next Crawl Phase"** |
 | **Failure** | `RuntimeError` on regional exhaustion → orchestrator skips corrupt file write |
+
 
 ### Phase 2.6: Recursive Deep-Crawl & URL Refinement
 
@@ -274,8 +281,11 @@ Both use `requests` with `timeout=(5, 15)` (connect 5s, read 15s), in-memory dow
 |------|--------|
 | **Module** | `AgentSynthesizer.synthesize_context(full_context)` |
 | **Context contract** | **Only** `core_context` + `user_intent` + `refined_data` (no disk re-reads; **no** Phase 2.2 full-text files) |
+| **Model & Orchestration** | Gemini 2.5 Pro (Initial draft synthesis) + Gemini 2.5 Flash (Synthesis Critic & Revision) |
+| **Synthesis Critic Loop** | The initial synthesis draft is critiqued by a Flash-based Synthesis Critic (`_CRITIQUE_PROMPT`) against the full research context to check for logical gaps, hallucinated facts, and explicit linkage between Existing Solutions and Methodological Weaknesses. If it fails, the critic provides a revised version fixing any gaps; otherwise, the initial draft is approved. |
 | **Rubric sections** | Problem Background, Existing Solutions, Methodological Weaknesses (The Gap), Proposed Novelty |
 | **Output** | `processed_summaries/<topic>_<timestamp>.md` (Phase 3 synthesis) → registered in `current_run_files` |
+
 
 ### Phase 4: Knowledge Graph Generation (Micro-Extraction Protocol)
 
@@ -457,7 +467,7 @@ This is a post-analysis phase that acts as a standalone pipeline. Students lever
    - Gathers candidate papers from:
      - Local scraped papers in `agent_scrapes/academic_scrape.md`.
      - Full-text processed papers in `processed_summaries/academic_fulltext_*.md`.
-     - 5 concurrent external searches using the LLM-generated `search_queries` against Semantic Scholar and Tavily.
+     - External searches using the LLM-generated `search_queries`: S2 (1 req/sec) and arXiv (1 req/5sec) run in **parallel threads** (each sequential within), Tavily runs sequentially after.
    - Deduplicates the full pool by normalized title, URL, or triage ID.
 
 3. **Phase 5.3: PDF Bookends Enrichment**:
@@ -468,14 +478,21 @@ This is a post-analysis phase that acts as a standalone pipeline. Students lever
    - The prompt instructs the model to critique the user's project idea against the combined context of what the paper set out to do (Abstract) and what they achieved or encountered as limits (Conclusion).
    - Applies a strict **relevance threshold (> 75%)** and retains the top 15 highest-scoring papers (saves to `matched_papers.json`).
 
-5. **Phase 5.5: Proposal Synthesis (`ProposalSynthesizer.py`)**:
-   - Gemini 2.5 Pro consumes the scoped project definition, the gap analysis, and the top matched papers to synthesize a formal Markdown proposal conforming to a rigid Roman numeral academic structure:
+5. **Phase 5.5: Proposal Synthesis & Critic Loop (`ProposalSynthesizer.py`)**:
+   - Synthesizes a formal Markdown proposal via Gemini 2.5 Pro using the scoped project definition, the gap analysis, and the top matched papers.
+   - **Proposal Critic Loop**: The initial proposal draft is evaluated by a Gemini 2.5 Flash critic (`_PROPOSAL_CRITIC_PROMPT`) against the user's scoped idea. The critic verifies:
+     * Strict adherence to the Roman numeral structure (I - VI).
+     * If the Core Features directly address the user's specific problem.
+     * If the Literature Matrix contains real, valid academic limitations.
+   - If the draft is rejected, the critic provides detailed feedback for revision. The synthesizer revises the draft incorporating the feedback, allowing up to 2 revision attempts before returning the best draft.
+   - The final proposal strictly conforms to a rigid Roman numeral academic structure:
      * **I. Executive Summary (The Problem & The Novelty)**: A compelling 2-3 paragraph introduction explaining the core problem and solution.
      * **II. Project Definition**: Detailed specifications (Task, Domain, Constraints).
      * **III. Matched Literature Review**: Highlighting the selected papers.
      * **IV. Academic Gap Alignment**: Synthesizing opportunities from the graph.
      * **V. Proposed Architecture & Methodology**: Divided into *V.A Feature Set* and *V.B Technical Challenges*.
      * **VI. Verification & Execution Plan**.
+
 
 ---
 

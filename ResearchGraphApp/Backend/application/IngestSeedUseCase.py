@@ -484,7 +484,7 @@ def execute(idea: str, url: str) -> dict:
 
     with ThreadPoolExecutor(max_workers=_PHASE2_WORKERS, thread_name_prefix="phase2") as pool:
         future_social = pool.submit(search_social_threads, primary_keyword)
-        future_academic = pool.submit(search_academic_papers, search_keywords)
+        future_academic = pool.submit(search_academic_papers, search_keywords, user_intent)
         future_wiki = pool.submit(get_wiki_summary, primary_keyword)
 
         futures_map = {

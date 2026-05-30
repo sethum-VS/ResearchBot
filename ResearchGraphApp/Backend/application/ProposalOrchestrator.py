@@ -552,37 +552,68 @@ def generate_proposal(
         flush=True,
     )
 
-    # Concurrently execute 5 external search queries
+    # Execute external search queries across S2, arXiv, and Tavily.
+    # S2 (1 req/sec) and arXiv (1 req/5sec) run in parallel threads,
+    # each executing individual sequential queries with their own rate limiter.
+    # Tavily runs sequentially after both complete.
     print(
-        f"PROGRESS: Phase 5 — external pass: executing {len(search_queries)} concurrent queries via S2 + Tavily...",
+        f"PROGRESS: Phase 5 — external pass: executing {len(search_queries)} queries "
+        f"via S2 + arXiv (parallel) + Tavily (sequential)...",
         flush=True,
     )
 
-    external_papers = []
+    external_papers: list[dict] = []
 
-    def fetch_for_query(q_str: str) -> list[dict]:
-        results = []
-        # S2 fetch
+    from infrastructure.AcademicScraper import _fetch_arxiv_papers_list
+
+    def _s2_search_all(queries: list[str]) -> list[dict]:
+        """Sequential S2 queries (1 req/sec enforced by _S2_LOCK)."""
+        results: list[dict] = []
+        for idx, q_str in enumerate(queries, 1):
+            try:
+                s2_papers = _fetch_semantic_scholar_keywords([q_str], max_keyword_slice=1)
+                for p in s2_papers:
+                    results.append({
+                        "title": p.title,
+                        "abstract": p.snippet or "",
+                        "triage_id": p.triage_id or (f"s2:{p.paper_id}" if p.paper_id else ""),
+                        "source_url": p.url,
+                        "source": "semantic_scholar",
+                        "year": "N/A",
+                        "pdf_url": p.pdf_url or "",
+                    })
+            except Exception as e:
+                logger.warning("Phase 5 S2 query %d/%d failed: %s", idx, len(queries), e)
+        return results
+
+    def _arxiv_search_all(queries: list[str]) -> list[dict]:
+        """Sequential arXiv queries (1 req/5sec enforced by _ARXIV_LOCK)."""
+        results: list[dict] = []
         try:
-            s2_papers = _fetch_semantic_scholar_keywords([q_str])
-            print(
-                f"PROGRESS: Phase 5 — Semantic Scholar search ok for query: '{q_str[:40]}...' ({len(s2_papers)} papers)",
-                flush=True,
-            )
-            for p in s2_papers:
+            arxiv_papers = _fetch_arxiv_papers_list(queries, max_keyword_slice=len(queries))
+            for p in arxiv_papers:
                 results.append({
                     "title": p.title,
                     "abstract": p.snippet or "",
-                    "triage_id": p.triage_id or (f"s2:{p.paper_id}" if p.paper_id else ""),
+                    "triage_id": p.triage_id or (f"arxiv:{p.arxiv_id}" if p.arxiv_id else ""),
                     "source_url": p.url,
-                    "source": "semantic_scholar",
+                    "source": "arxiv",
                     "year": "N/A",
                     "pdf_url": p.pdf_url or "",
                 })
         except Exception as e:
-            logger.warning("S2 query %r failed: %s", q_str, e)
+            logger.warning("Phase 5 arXiv search failed: %s", e)
+        return results
 
-        # Tavily fetch
+    # Parallel: S2 + arXiv (each with its own independent rate limiter)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="p5_src") as pool:
+        s2_future = pool.submit(_s2_search_all, search_queries)
+        arxiv_future = pool.submit(_arxiv_search_all, search_queries)
+        external_papers.extend(s2_future.result())
+        external_papers.extend(arxiv_future.result())
+
+    # Sequential: Tavily
+    for q_str in search_queries:
         try:
             tav_papers, err = _fetch_tavily_keywords([q_str])
             if not err:
@@ -591,7 +622,7 @@ def generate_proposal(
                     flush=True,
                 )
                 for p in tav_papers:
-                    results.append({
+                    external_papers.append({
                         "title": p.title,
                         "abstract": p.snippet or "",
                         "triage_id": p.triage_id or (f"tavily:{p.url}" if p.url else ""),
@@ -601,19 +632,9 @@ def generate_proposal(
                         "pdf_url": p.pdf_url or "",
                     })
             else:
-                logger.warning("Tavily query %r failed: %s", q_str, err)
+                logger.warning("Phase 5 Tavily query %r error: %s", q_str, err)
         except Exception as e:
-            logger.warning("Tavily query %r failed: %s", q_str, e)
-
-        return results
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(fetch_for_query, q): q for q in search_queries}
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                external_papers.extend(future.result())
-            except Exception as e:
-                logger.error("External query worker encountered error: %s", e)
+            logger.warning("Phase 5 Tavily query %r failed: %s", q_str, e)
 
     # Deduplicate the entire pool based on title, URL, or triage ID
     seen_titles = set()

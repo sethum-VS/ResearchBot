@@ -116,10 +116,15 @@ graph TD
 The Research Implementation Pipeline coordinates real-time data ingestion, open-access paper triaging, semantic entity extraction, and structural graph gap-hunting to isolate and diagnose academic limitations:
 
 ### Multi-Source Academic & Social Ingestion
-The ingestion scraper pulls concurrently from Semantic Scholar, arXiv, and Tavily to build a multi-dimensional foundation for analysis. The scraper implements rate-pacing protocols, backoffs based on HTTP Retry-After headers, and an automatic circuit-breaker behavior that skips degraded endpoints while preserving successful threads.
+The ingestion scraper pulls concurrently from Semantic Scholar, arXiv, and Tavily to build a multi-dimensional foundation for analysis. To ensure extreme resilience against strict academic rate limits (HTTP 429), the scraper implements boolean query batching to reduce API request density, utilizes `tenacity` for exponential backoffs, and enforces automatic circuit-breaker behaviors that cleanly skip degraded endpoints while preserving successful threads.
 
-### Open-Access PDF Triage
-For all located papers featuring valid PDF URLs, ResearchBot executes a high-speed triage phase. Using Gemini 2.5 Flash, the engine filters up to 25 titles and abstracts, selects the top 5 most relevant targets, and pulls down full-document text via a PyMuPDF extraction pool.
+### Optimized Two-Tiered Open-Access PDF Triage
+ResearchBot implements a high-efficiency two-tiered paper pool filtration system for Phase 2.2 Open-Access PDF triage, aggressively reducing token usage and API density while preserving evaluation accuracy:
+
+* **Semantic Expansion (Tier 0)**: Before querying any academic source, Gemini 2.5 Flash generates 5 highly specific semantic search queries and a 2-sentence `core_criteria` definition from the user's research topic and intent. These queries cast a wide net across Semantic Scholar, arXiv, and Tavily to build a "Mega-Pool" of 50–80 deduplicated candidate papers.
+* **Semantic Matcher Scoring (Tier 1)**: To preserve network and memory bandwidth, every paper in the Mega-Pool is immediately scored based on its *Abstract only* against the `core_criteria` using the `SemanticMatcher`. Papers scoring below 75% are instantly discarded.
+* **Bookend Extraction (Tier 1.5)**: Only for the highly-relevant surviving papers, a concurrent worker pool (`ThreadPoolExecutor`, 5 workers) downloads the PDF and extracts the Abstract and Conclusion using `TextChunker.extract_academic_bookends(max_chars=8000)`.
+* **Triage Critic (Tier 2)**: The top surviving papers (capped at 15), now enriched with their conclusion bookends, are passed to the Evaluator Agent (Triage Critic). It performs a deep methodological evaluation and selects the absolute best 5 papers for complete full-text extraction via PyMuPDF.
 
 ### Interactive Knowledge Graphs
 Ingested documents are compiled into structural visual networks using the Graphify entity-relation extraction framework. Graphify parses primary research documents into a typed graph schema using Llama 4 Scout (10M token context window) via the local FastAPI VertexProxy bridge. 
@@ -347,6 +352,7 @@ The following environment variables control thresholds, timing parameters, and f
 | `ACADEMIC_TRIAGE_POOL_MAX` | `25` | Target quantity of Open Access papers sent to initial Flash triage. |
 | `ACADEMIC_FULLTEXT_MAX_CHARS` | `100000` | Hard cap on characters extracted from a single open-access PDF. |
 | `ACADEMIC_FULLTEXT_MAX_BYTES` | `52428800` | Maximum size limits (50 MB) allowed for triaged PDF downloads. |
+| `MEGA_POOL_BOOKEND_MAX_CHARS` | `8000` | Maximum characters for Abstract+Conclusion bookend extraction during Tier 1 Mega-Pool scoring. |
 
 ---
 
