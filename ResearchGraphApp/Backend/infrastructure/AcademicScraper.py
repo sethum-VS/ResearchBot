@@ -58,6 +58,28 @@ logger = logging.getLogger(__name__)
 _PDF_TEXT_CACHE: dict[str, str] = {}
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, str(default))
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+
 S2_BASE_URL = "https://api.semanticscholar.org/graph/v1"
 S2_SEARCH_PATH = "/paper/search"
 S2_FIELDS = "title,url,abstract,year,citationCount,isOpenAccess,openAccessPdf,externalIds,tldr,paperId"
@@ -68,7 +90,7 @@ S2_PER_KEYWORD_LIMIT = 10
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 ARXIV_PER_KEYWORD_LIMIT = 10
 ARXIV_ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
-ARXIV_REQUEST_TIMEOUT_SEC = 15   # Reduced from 30s — fail fast on slow arXiv
+ARXIV_REQUEST_TIMEOUT_SEC = 30   # Increased to 30s to allow slower optimized queries to succeed
 
 # Time-based half-open circuit breaker (replaces boolean _ARXIV_CIRCUIT_OPEN)
 _ARXIV_CIRCUIT_OPEN_UNTIL = 0.0          # epoch timestamp; 0 = circuit closed
@@ -77,17 +99,18 @@ _ARXIV_CIRCUIT_COOLDOWN_SEC = 120.0      # reset after 2 minutes
 ACADEMIC_DOMAINS = ["arxiv.org", "researchgate.net", "scholar.google.com"]
 TAVILY_PER_KEYWORD_LIMIT = 5
 KEYWORD_SLICE = 3
-_PDF_EXTRACT_WORKERS = 5
-_FULLTEXT_TARGET = 5
-_FULLTEXT_MAX_PDF_ATTEMPTS = _FULLTEXT_TARGET + 3
+_PDF_EXTRACT_WORKERS = _env_int("PDF_EXTRACT_WORKERS", 10)
+_FULLTEXT_TARGET = _env_int("FULLTEXT_TARGET", 25)
+_FULLTEXT_MAX_PDF_ATTEMPTS = _FULLTEXT_TARGET + 5
 _TRIAGE_MODEL = "gemini-2.5-flash"
 
 # ── Two-Tiered Mega-Pool Constants ─────────────────────────────────────────
 _MEGA_POOL_KEYWORD_SLICE = 5               # Use all 5 LLM-generated queries
-_MEGA_POOL_SCORER_WORKERS = 5              # Concurrent scoring workers
-_MEGA_POOL_BOOKEND_WORKERS = 5             # Concurrent bookend extraction workers
+_MEGA_POOL_SCORER_WORKERS = _env_int("MEGA_POOL_SCORER_WORKERS", 10)
+_MEGA_POOL_BOOKEND_WORKERS = _env_int("MEGA_POOL_BOOKEND_WORKERS", 10)
 _MEGA_POOL_THRESHOLD = 75.0                # Minimum score to survive Tier 1
-_MEGA_POOL_CRITIC_INPUT_CAP = 15           # Max papers sent to Triage Critic
+_MEGA_POOL_CRITIC_INPUT_CAP = _env_int("MEGA_POOL_CRITIC_INPUT_CAP", 40)
+
 
 _S2_PAPER_URL_RE = re.compile(
     r"https?://(?:www\.)?semanticscholar\.org/paper/([0-9a-fA-F]{38,40})\b",
@@ -525,26 +548,6 @@ def _s2_headers() -> dict[str, str]:
     return headers
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name, str(default))
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, str(default))
-    try:
-        return max(0, int(raw))
-    except ValueError:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name, "true" if default else "false").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
 
 def _parse_retry_after(response: requests.Response) -> float:
     header = (response.headers.get("Retry-After") or "").strip()
@@ -853,6 +856,13 @@ def _format_arxiv_query_term(kw: str) -> str:
     ]
     if not words:
         return ""
+    
+    # Cap word list to a maximum of 4 high-value terms to prevent extremely slow
+    # Lucene execution queries on the under-provisioned arXiv export API server,
+    # which leads to read timeouts (e.g. read timeout=15).
+    if len(words) > 4:
+        words = words[:4]
+
     if len(words) <= 2:
         return f'all:"{" ".join(words)}"'
     else:

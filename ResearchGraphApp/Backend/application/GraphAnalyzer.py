@@ -61,18 +61,19 @@ _ALLOWED_CORPUS_PARENTS = frozenset({"processed_summaries", "agent_scrapes"})
 
 # Per-file semantic chunking threshold (see TextChunker.extract_academic_bookends).
 _LARGE_FILE_THRESHOLD = 60_000
+_MAX_CHARS_PER_ACADEMIC_FILE = 75_000
 
 # Graphify graphs with fewer nodes get a document-derived topology fallback.
 _MIN_GRAPH_NODES = 2
 
 # Keep map prompts under Gemini's per-request input limit (topology + system + corpus).
-# ~180k chars leaves headroom for full topology + prompts under 65k tokens.
-_MAX_TOTAL_CORPUS_CHARS = 180_000
+# 600k chars utilises enterprise-tier quotas; leaves ample headroom for topology + prompts.
+_MAX_TOTAL_CORPUS_CHARS = 600_000
 
 # Dynamic corpus allocation — protected buckets (Phase 4.5).
-_SYNTHESIS_BUDGET = 40_000
-_WEB_SCRAPE_BUDGET = 80_000
-_ACADEMIC_BUDGET = 120_000
+_SYNTHESIS_BUDGET = 50_000
+_WEB_SCRAPE_BUDGET = 100_000
+_ACADEMIC_BUDGET = 450_000
 
 _CorpusEntry = tuple[Path, str, str]  # path, filename, delimited block
 
@@ -446,12 +447,19 @@ def _read_single_markdown(raw_path: Path) -> tuple[str, str] | None:
         return None
     if not text.strip():
         return None
-    if len(text) > _LARGE_FILE_THRESHOLD:
-        original_len = len(text)
+    bucket = _classify_corpus_bucket(raw_path) or "corpus"
+    original_len = len(text)
+    
+    if bucket == "academic":
+        text = extract_academic_bookends(text, max_chars=_MAX_CHARS_PER_ACADEMIC_FILE)
+        if len(text) == _MAX_CHARS_PER_ACADEMIC_FILE:
+            text += "\n\n[WARNING: Paper truncated to meet 75,000 character limit]"
+    else:
         text = extract_academic_bookends(text, max_chars=_LARGE_FILE_THRESHOLD)
-        bucket = _classify_corpus_bucket(raw_path) or "corpus"
+
+    if len(text) < original_len:
         print(
-            f"PROGRESS: Phase 4.5 — intelligently chunking large {bucket} file "
+            f"PROGRESS: Phase 4.5 — intelligently chunking {bucket} file "
             f"{raw_path.name} ({original_len:,} → {len(text):,} chars).",
             flush=True,
         )
@@ -530,7 +538,7 @@ def _trim_priority(path: Path) -> int:
 def _apply_global_corpus_safety_net(
     included: list[_CorpusEntry],
 ) -> tuple[list[_CorpusEntry], int]:
-    """Drop whole files (lowest priority first) if bucket totals exceed 240k."""
+    """Drop whole files (lowest priority first) if bucket totals exceed the 600k cap."""
     total = sum(len(entry[2]) for entry in included)
     if total <= _MAX_TOTAL_CORPUS_CHARS:
         return included, 0
@@ -561,8 +569,7 @@ def _apply_dynamic_corpus_allocation(
     entries: list[_CorpusEntry],
 ) -> tuple[str, list[str], int]:
     """
-    Pack SOURCE DOCUMENTS into protected synthesis / web / academic buckets,
-    apply synthesis rollover (academic first, then web), then enforce 240k cap.
+    Pack SOURCE DOCUMENTS into protected synthesis, web, and academic buckets.
     """
     synthesis_entries: list[_CorpusEntry] = []
     web_entries: list[_CorpusEntry] = []
@@ -584,24 +591,26 @@ def _apply_dynamic_corpus_allocation(
     syn_inc, syn_used, syn_skip = _pack_bucket(synthesis_entries, _SYNTHESIS_BUDGET)
     synthesis_spare = _SYNTHESIS_BUDGET - syn_used
 
-    # Rollover: spare → academic cap first, then any unused spare → web cap.
-    academic_cap = _ACADEMIC_BUDGET + synthesis_spare
-    acad_inc, acad_used, acad_skip = _pack_bucket(academic_entries, academic_cap)
-    bonus_consumed = min(synthesis_spare, max(0, acad_used - _ACADEMIC_BUDGET))
-    web_cap = _WEB_SCRAPE_BUDGET + (synthesis_spare - bonus_consumed)
+    # Rollover: unused synthesis -> Web (up to hard ceiling of 120_000 for web)
+    web_cap_max = 120_000
+    web_rollover_allowed = max(0, web_cap_max - _WEB_SCRAPE_BUDGET)
+    web_rollover_actual = min(synthesis_spare, web_rollover_allowed)
+    web_cap = _WEB_SCRAPE_BUDGET + web_rollover_actual
+    
     web_inc, web_used, web_skip = _pack_bucket(web_entries, web_cap)
-    # SOURCE DOCUMENTS block order: synthesis → web → academic (load narrative).
+    web_spare = web_cap - web_used
 
-    if synthesis_spare > 0:
-        rollover_parts = [
-            f"{synthesis_spare:,} chars synthesis spare → academic "
-            f"(+{synthesis_spare:,} cap)"
-        ]
-        web_rollover = synthesis_spare - bonus_consumed
-        if web_rollover > 0:
-            rollover_parts.append(
-                f"{web_rollover:,} chars → web (+{web_rollover:,} cap)"
-            )
+    # All remaining unused capacity across both Synthesis and Web must roll entirely into Academic
+    academic_cap = _ACADEMIC_BUDGET + (synthesis_spare - web_rollover_actual) + web_spare
+    acad_inc, acad_used, acad_skip = _pack_bucket(academic_entries, academic_cap)
+
+    if synthesis_spare > 0 or web_spare > 0:
+        rollover_parts = []
+        if web_rollover_actual > 0:
+            rollover_parts.append(f"{web_rollover_actual:,} chars synthesis spare → web (+{web_rollover_actual:,} cap)")
+        acad_bonus = (synthesis_spare - web_rollover_actual) + web_spare
+        if acad_bonus > 0:
+            rollover_parts.append(f"{acad_bonus:,} chars spare → academic (+{acad_bonus:,} cap)")
         print(
             f"PROGRESS: Phase 4.5 — corpus rollover: {'; '.join(rollover_parts)}.",
             flush=True,
@@ -623,7 +632,7 @@ def _apply_dynamic_corpus_allocation(
         )
 
     print(
-        "PROGRESS: Phase 4.5 — dynamic corpus: "
+        f"PROGRESS: Phase 4.5 — dynamic corpus (cap={_MAX_TOTAL_CORPUS_CHARS:,}): "
         + _bucket_line(
             "synthesis",
             syn_inc,
@@ -654,12 +663,12 @@ def _apply_dynamic_corpus_allocation(
         flush=True,
     )
 
+    # SOURCE DOCUMENTS block order: synthesis → web → academic (load narrative).
     all_inc = syn_inc + web_inc + acad_inc
     all_inc, safety_dropped = _apply_global_corpus_safety_net(all_inc)
 
     blocks = [entry[2] for entry in all_inc]
     filenames = [entry[1] for entry in all_inc]
-    total_chars = sum(len(b) for b in blocks)
     bucket_omitted = syn_skip + web_skip + acad_skip + safety_dropped
 
     if bucket_omitted and not safety_dropped:
