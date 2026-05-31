@@ -227,19 +227,19 @@ This phase uses a rigorous, multi-tiered filtration pipeline to dramatically red
 | **1. Mega-Pool Fetch** | Fetch from S2/arXiv/Tavily using the expanded semantic queries, building a large pool of 50-80 candidate papers. |
 | **2. Tier 1 Scoring** | **Semantic Matcher**: Scores every paper (Abstract only) against the `core_criteria`. Applies a strict > 75% threshold. Papers below 75% are immediately discarded to save bandwidth. |
 | **3. Bookend Extraction** | **Tier 1.5**: Only for the highly-relevant surviving papers, a concurrent pool extracts their Abstract + Conclusion bookends. |
-| **4. Triage Critic** | **Tier 2**: The top 15 bookend-enriched papers are evaluated by the Triage Critic, which selects the absolute best 5 papers. |
-| **5. Full PDF I/O** | `ThreadPoolExecutor` downloads the complete full-text PDF (all pages) for the 5 selected papers. |
+| **4. Triage Critic** | **Tier 2**: The top 40 (was 15) bookend-enriched papers are evaluated by the Triage Critic, which selects the absolute best 25 papers (was 5). |
+| **5. Full PDF I/O** | `ThreadPoolExecutor` downloads the complete full-text PDF (all pages) for the 25 selected papers. |
 | **6. Persist** | Orchestrator writes `processed_summaries/academic_fulltext_{triage_id}_{timestamp}.md` |
 
 **Stdout examples:**
 
 ```
-PROGRESS: Phase 2.2 — triaging 22 OA candidates (max pool 25)...
-PROGRESS: Phase 2.2 — Flash selected 5 papers for full-text review.
-PROGRESS: Phase 2.2 — fetching full text for up to 5 papers (8 PDF attempt(s) max, 5 workers)...
-PROGRESS: Phase 2.2 — full-text [3/8] ok: https://arxiv.org/pdf/...
-PROGRESS: Phase 2.2 — full-text complete (5/5 saved).
-PROGRESS: Phase 2.2 — saving 5 full-text papers to processed_summaries/ (DataRefiner bypass)...
+PROGRESS: Phase 2.2 — triaging 35 OA candidates (max pool 40)...
+PROGRESS: Phase 2.2 — Flash selected 25 papers for full-text review.
+PROGRESS: Phase 2.2 — fetching full text for up to 25 papers (30 PDF attempt(s) max, 10 workers)...
+PROGRESS: Phase 2.2 — full-text [3/30] ok: https://arxiv.org/pdf/...
+PROGRESS: Phase 2.2 — full-text complete (25/25 saved).
+PROGRESS: Phase 2.2 — saving 25 full-text papers to processed_summaries/ (DataRefiner bypass)...
 PROGRESS: Phase 2.2 — saved academic_fulltext_arxiv_1706_03762_20260522T120000.md
 ```
 
@@ -336,8 +336,8 @@ Phase 4.5 avoids a single monolithic Gemini call over the full graph + corpus (h
 | **Corpus I/O** | `_load_source_corpus_async()` — concurrent per-file reads via `asyncio.gather` + `asyncio.to_thread` |
 | **Corpus alignment** | **Strict Graphify parity:** only `.md` files under `processed_summaries/` or `agent_scrapes/` (`_ALLOWED_CORPUS_PARENTS`). Paths in `raw_ingestion/` (e.g. social scrapes) are **never** loaded, even if present on `current_run_files`. Logs skipped count when non-graphify paths are dropped. |
 | **Corpus scope** | Every `.md` in the two allowed directories is eligible (all `agent_scrapes/` outputs including web, wiki, refined ledger, `academic_scrape.md`, and `*_URLRefiner.md`). No extra per-file semantic filter beyond the directory gate. |
-| **Per-file compression** | Files **> 60,000** chars → `TextChunker.extract_academic_bookends()` (replaces legacy 120k tail-trim). See **Intelligent chunker** below. |
-| **Total corpus budget** | `_MAX_TOTAL_CORPUS_CHARS = 180_000` global safety net (fits Gemini map input with full topology); `_apply_dynamic_corpus_allocation()` uses protected per-category buckets (whole files only — no head-truncation). |
+| **Per-file compression** | Files **> 60,000** chars → `TextChunker.extract_academic_bookends()` (replaces legacy 120k tail-trim). This compression is always pre-applied greedily before budget calculations to eliminate the pre-chunking budget deficit bug. |
+| **Total corpus budget** | `_MAX_TOTAL_CORPUS_CHARS = 600_000` global safety net (fits Gemini map input with full topology); `_apply_dynamic_corpus_allocation()` uses protected per-category buckets (whole files only — no head-truncation). |
 | **Reference hygiene** | `_sanitize_references()` drops any filename not present in the **budget-included** loaded corpus (`source_files` lists survivors only) |
 | **Persistence** | Orchestrator writes `session_dir/academic_gap_analysis.json` for HistoryView reload |
 
@@ -345,15 +345,15 @@ Phase 4.5 avoids a single monolithic Gemini call over the full graph + corpus (h
 
 | Bucket | Cap | Sources | Load order |
 |--------|-----|---------|------------|
-| **Synthesis** | `40_000` (`_SYNTHESIS_BUDGET`) | `processed_summaries/*.md` **except** `academic_fulltext_*` (Phase 3 synthesis) | 1st |
-| **Web** | `80_000` (`_WEB_SCRAPE_BUDGET`) + rollover | All `agent_scrapes/` (web, wiki, Phase 2.5 ledger, `academic_scrape.md`, `*_URLRefiner.md`); URLRefiner files first, then newest-first within tier | 2nd |
-| **Academic** | `120_000` (`_ACADEMIC_BUDGET`) + rollover | `processed_summaries/academic_fulltext_*.md` only; newest-first (`mtime` desc); files **> 60k** chars chunked via `extract_academic_bookends` before delimiters | 3rd (packed before web only to compute rollover caps; concatenated **after** web in the prompt) |
+| **Synthesis** | `50_000` (`_SYNTHESIS_BUDGET`) | `processed_summaries/*.md` **except** `academic_fulltext_*` (Phase 3 synthesis) | 1st |
+| **Web** | `100_000` (`_WEB_SCRAPE_BUDGET`) + rollover | All `agent_scrapes/` (web, wiki, Phase 2.5 ledger, `academic_scrape.md`, `*_URLRefiner.md`); URLRefiner files first, then newest-first within tier | 2nd |
+| **Academic** | `450_000` (`_ACADEMIC_BUDGET`) + rollover | `processed_summaries/academic_fulltext_*.md` only; newest-first (`mtime` desc); files **> 60k** chars chunked via `extract_academic_bookends` before delimiters | 3rd (packed before web only to compute rollover caps; concatenated **after** web in the prompt) |
 
-**Rollover:** Unused synthesis budget rolls to **academic cap first**, then any spare not consumed beyond the base 120k academic cap rolls to **web**. No web→academic rollover.
+**Rollover:** Unused synthesis budget rolls to **academic cap first**, then any spare not consumed beyond the base 450k academic cap rolls to **web**. No web→academic rollover.
 
 **Omission:** Files that do not fit their bucket as whole `<<<FILE: …>>>` blocks are skipped (not head-truncated).
 
-**Global safety net:** If bucket totals exceed 180k, drop whole files lowest-priority first: generic `agent_scrapes/` → `*_URLRefiner.md` → `academic_fulltext_*.md` → synthesis last.
+**Global safety net:** If bucket totals exceed 600k, drop whole files lowest-priority first: generic `agent_scrapes/` → `*_URLRefiner.md` → `academic_fulltext_*.md` → synthesis last.
 
 Omitted files cannot be cited in `references`.
 
