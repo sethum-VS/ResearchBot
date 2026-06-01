@@ -278,7 +278,7 @@ _PROPOSAL_CRITIC_PROMPT = """Grade this proposal.
 1. Does it strictly follow the Roman numeral format (I - VI)? 
 2. Are the 'Core Features' actually solving the user's specific problem? 
 3. Does the Literature Matrix contain real limitations? 
-Output a JSON object: {"passed": boolean, "feedback": "Specific instructions for revision if failed"}.
+Output a JSON object: {{"passed": boolean, "feedback": "Specific instructions for revision if failed"}}.
 
 --- USER SCOPED IDEA ---
 {scoped_idea}
@@ -295,21 +295,19 @@ def generate_draft(system_instruction: str, content_prompt: str, project_id: str
     )
     last_exc: Exception | None = None
 
-    try:
-        client = genai.Client(vertexai=True, project=project_id, location="global")
-        result = _call_pro_with_retry(client, [content_prompt], config)
-        return result
-    except Exception as exc:
-        logger.warning("ProposalSynthesizer generator global failed: %s", exc)
-        last_exc = exc
-
-    for region in _STABLE_REGIONS:
+    for region in ["global"] + _STABLE_REGIONS:
         try:
-            client = genai.Client(vertexai=True, project=project_id, location=region)
+            client = genai.Client(
+                vertexai=True, 
+                project=project_id, 
+                location=region,
+                http_options={'timeout': 600000.0}
+            )
             result = _call_pro_with_retry(client, [content_prompt], config)
             return result
         except Exception as exc:
             logger.warning("ProposalSynthesizer generator region %s failed: %s", region, exc)
+            print(f"PROGRESS: Phase 5.5 — generator region {region} failed: {exc}", flush=True)
             last_exc = exc
 
     raise RuntimeError(f"ProposalSynthesizer generator all regions exhausted. Last error: {last_exc}")
@@ -341,24 +339,23 @@ def evaluate_draft(draft: str, scoped_idea: str, project_id: str) -> dict:
     config = types.GenerateContentConfig(response_mime_type="application/json")
     last_exc: Exception | None = None
 
-    try:
-        client = genai.Client(vertexai=True, project=project_id, location="global")
-        raw = _call_flash_critic(client, prompt, config)
-        return json.loads(raw)
-    except Exception as exc:
-        logger.warning("ProposalSynthesizer critic global failed: %s", exc)
-        last_exc = exc
-
-    for region in _STABLE_REGIONS:
+    for region in ["global"] + _STABLE_REGIONS:
         try:
-            client = genai.Client(vertexai=True, project=project_id, location=region)
+            client = genai.Client(
+                vertexai=True, 
+                project=project_id, 
+                location=region,
+                http_options={'timeout': 600000.0}
+            )
             raw = _call_flash_critic(client, prompt, config)
             return json.loads(raw)
         except Exception as exc:
             logger.warning("ProposalSynthesizer critic region %s failed: %s", region, exc)
+            print(f"PROGRESS: Phase 5.5 — critic region {region} failed: {exc}", flush=True)
             last_exc = exc
 
     logger.warning("ProposalSynthesizer critic exhausted all regions, bypassing.")
+    print("PROGRESS: Phase 5.5 — critic exhausted all regions, bypassing.", flush=True)
     return {"passed": True, "feedback": ""}
 
 
