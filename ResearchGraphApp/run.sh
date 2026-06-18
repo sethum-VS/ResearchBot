@@ -35,6 +35,65 @@ else
     echo "✅ Backend .venv found."
 fi
 
+# --- 0b. Graphify CLI Tool Setup ---
+echo "📊 Checking for Graphify CLI..."
+GRAPHIFY_BIN=""
+if command -v graphify &> /dev/null; then
+    GRAPHIFY_BIN=$(command -v graphify)
+elif [ -x "$HOME/.local/bin/graphify" ]; then
+    GRAPHIFY_BIN="$HOME/.local/bin/graphify"
+elif [ -x "/opt/homebrew/bin/graphify" ]; then
+    GRAPHIFY_BIN="/opt/homebrew/bin/graphify"
+elif [ -x "/usr/local/bin/graphify" ]; then
+    GRAPHIFY_BIN="/usr/local/bin/graphify"
+fi
+
+if [ -n "$GRAPHIFY_BIN" ]; then
+    echo "✅ Graphify CLI found at $GRAPHIFY_BIN"
+    # Ensure it's in the current script PATH if it was found in ~/.local/bin but not in PATH
+    if ! command -v graphify &> /dev/null && [ "$GRAPHIFY_BIN" = "$HOME/.local/bin/graphify" ]; then
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+else
+    echo "⚠️  Graphify CLI not found. Attempting automatic installation of 'graphifyy'..."
+    if command -v uv &> /dev/null; then
+        echo "📦 Installing graphifyy via uv..."
+        uv tool install graphifyy
+        export PATH="$HOME/.local/bin:$PATH"
+    elif command -v pipx &> /dev/null; then
+        echo "📦 Installing graphifyy via pipx..."
+        pipx install graphifyy
+        export PATH="$HOME/.local/bin:$PATH"
+    else
+        echo "📦 Installing graphifyy via pip3..."
+        pip3 install --user graphifyy
+        export PATH="$HOME/.local/bin:$PATH"
+        USER_PYTHON_BIN=$(python3 -m site --user-base 2>/dev/null)/bin
+        if [ -d "$USER_PYTHON_BIN" ]; then
+            export PATH="$USER_PYTHON_BIN:$PATH"
+        fi
+    fi
+
+    # Re-verify installation status
+    if command -v graphify &> /dev/null || [ -x "$HOME/.local/bin/graphify" ]; then
+        echo "✅ Graphify CLI successfully installed."
+        if [ -x "$HOME/.local/bin/graphify" ] && ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
+            export PATH="$HOME/.local/bin:$PATH"
+        fi
+    else
+        echo "❌ Warning: Graphify installation completed, but 'graphify' executable is still not found in PATH."
+        echo "   Please manually run: pip install graphifyy and add its directory to your PATH."
+    fi
+fi
+
+# Double check if PATH needs permanent update advice
+if [ -x "$HOME/.local/bin/graphify" ] && ! echo "$PATH" | grep -q "$HOME/.local/bin"; then
+    echo "⚠️  Note: 'graphify' is installed in ~/.local/bin, which is not in your shell's permanent PATH."
+    echo "   We have temporarily added it for this session, but you should add it to your shell profile permanently:"
+    echo "   echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.zshrc"
+fi
+
+
 # --- 1. GCP Auth Auto-Remedy ---
 echo "☁️  Checking Google Cloud ADC..."
 GCP_CREDS="$HOME/.config/gcloud/application_default_credentials.json"
